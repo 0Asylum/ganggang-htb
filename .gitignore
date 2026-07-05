@@ -1,0 +1,11 @@
+.git
+.env
+burp_req/
+.venv/
+tmp/
+database.db
+examples/
+config.json
+bot.log
+cache/
+__pycache__/
