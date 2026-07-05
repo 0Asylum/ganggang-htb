@@ -20,6 +20,7 @@ ROLE_OWNER = 2
 COMMAND_HELP = [
     ("ganggang",     "!ganggang",                       "gang gang",                                   ROLE_EVERYONE),
     ("ping",         "!ping",                           "health check",                                ROLE_EVERYONE),
+    ("version",      "!version",                        "show the bot's current version",             ROLE_EVERYONE),
     ("stats",        "!stats [profileID|name|@mention]", "show a member's HTB stats card (default: yourself, if claimed)", ROLE_EVERYONE),
     ("leaderboard",  "!leaderboard [points|bloods|season]", "top 10 leaderboard (default: points)",     ROLE_EVERYONE),
     ("help",         "!help",                           "show this message",                           ROLE_EVERYONE),
@@ -228,6 +229,16 @@ def _parse_discord_id(text):
 async def cmd_ganggang(message, data, api):
     """!ganggang -- replies with "ganggang"."""
     await message.channel.send("ganggang")
+
+
+async def cmd_version(message, data, api):
+    """!version -- shows the bot's current version, read from version.txt."""
+    try:
+        with open("version.txt") as f:
+            version = f.read().strip()
+    except OSError:
+        version = "unknown"
+    await message.channel.send(f"ggasylum v{version}")
 
 
 async def cmd_ping(message, data, api):
@@ -1117,6 +1128,7 @@ async def cmd_show_stale(message, data, api):
 COMMANDS = {
     "ganggang":     (cmd_ganggang,     ROLE_EVERYONE),
     "ping":         (cmd_ping,         ROLE_EVERYONE),
+    "version":      (cmd_version,      ROLE_EVERYONE),
     "stats":        (cmd_stats,        ROLE_EVERYONE),
     "leaderboard":  (cmd_leaderboard,  ROLE_EVERYONE),
     "help":         (cmd_help,         ROLE_EVERYONE),
