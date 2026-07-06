@@ -40,6 +40,15 @@ BLOOD_SIZE     = 45
 # bottom of machine area
 ICONS_Y = MACHINE_POS[1] + MACHINE_SIZE - ICON_SIZE + 3
 
+# (size, max_chars) tiers for the body line, largest-fits-first. max_chars is
+# how many characters fit before the box avatar at x=660; text past the
+# smallest tier gets truncated with an ellipsis.
+BODY_TEXT_FONT_TIERS = [
+    (30, 27),
+    (24, 34),
+    (18, 46),
+]
+
 
 def _load_blood(filename):
     """Loads a blood-drop asset and scales it to BLOOD_SIZE tall, preserving
@@ -80,6 +89,18 @@ def _circle_crop(img):
     return out
 
 
+def _fit_body_text(text):
+    """Picks the largest size from BODY_TEXT_FONT_TIERS that fits `text`
+    (returns it unchanged), or truncates it with an ellipsis at the smallest
+    tier's size if even that doesn't fit.
+    """
+    smallest_size, smallest_max = BODY_TEXT_FONT_TIERS[-1]
+    for size, max_chars in BODY_TEXT_FONT_TIERS:
+        if len(text) <= max_chars:
+            return text, size
+    return text[:smallest_max - 1] + "…", smallest_size
+
+
 def generate_solve_image(entry, user_avatar_path, machine_avatar_path=None,
                           discord_display_name=None, tag=None):
     """Renders a pwn-alert card (PNG, returned as a BytesIO) for one solve:
@@ -103,12 +124,14 @@ def generate_solve_image(entry, user_avatar_path, machine_avatar_path=None,
     else:
         body_text = f"Just solved {obj_name}"
 
+    body_text, body_font_size = _fit_body_text(body_text)
+
     img  = Image.new("RGBA", (IMG_W, IMG_H), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
     try:
         font_bold   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Bold.ttf"), 50)
-        font_body   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 30)
+        font_body   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), body_font_size)
         font_handle = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 22)
         font_tag    = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 15)
     except Exception:
