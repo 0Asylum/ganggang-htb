@@ -40,6 +40,21 @@ BLOOD_SIZE     = 45
 # bottom of machine area
 ICONS_Y = MACHINE_POS[1] + MACHINE_SIZE - ICON_SIZE + 3
 
+# The body line ("Just solved X" / "Just got root on X") sits at x=228 (same
+# column as the username) and must clear the box avatar at x=660 -- a 432px
+# column, minus a 16px safety margin. UbuntuMono-Regular is monospaced, so each
+# tier's max_chars is floor(416 / char_width_at_that_size), verified directly
+# against the font. Long challenge/machine names (e.g. "Social Media
+# Investigation Hub") shrink through these tiers before ever needing to
+# truncate, so the name stays fully readable in all but the most extreme case.
+# (size, max_chars) pairs, smallest-first fallback is the last entry -- text
+# still longer than that gets truncated with an ellipsis at that size.
+BODY_TEXT_FONT_TIERS = [
+    (30, 27),
+    (24, 34),
+    (18, 46),
+]
+
 
 def _load_blood(filename):
     """Loads a blood-drop asset and scales it to BLOOD_SIZE tall, preserving
@@ -80,6 +95,18 @@ def _circle_crop(img):
     return out
 
 
+def _fit_body_text(text):
+    """Picks the largest size from BODY_TEXT_FONT_TIERS that fits `text`
+    (returns it unchanged), or truncates it with an ellipsis at the smallest
+    tier's size if even that doesn't fit.
+    """
+    smallest_size, smallest_max = BODY_TEXT_FONT_TIERS[-1]
+    for size, max_chars in BODY_TEXT_FONT_TIERS:
+        if len(text) <= max_chars:
+            return text, size
+    return text[:smallest_max - 1] + "…", smallest_size
+
+
 def generate_solve_image(entry, user_avatar_path, machine_avatar_path=None,
                           discord_display_name=None, tag=None):
     """Renders a pwn-alert card (PNG, returned as a BytesIO) for one solve:
@@ -103,12 +130,14 @@ def generate_solve_image(entry, user_avatar_path, machine_avatar_path=None,
     else:
         body_text = f"Just solved {obj_name}"
 
+    body_text, body_font_size = _fit_body_text(body_text)
+
     img  = Image.new("RGBA", (IMG_W, IMG_H), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
     try:
         font_bold   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Bold.ttf"), 50)
-        font_body   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 30)
+        font_body   = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), body_font_size)
         font_handle = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 22)
         font_tag    = ImageFont.truetype(str(ASSETS / "UbuntuMono-Regular.ttf"), 15)
     except Exception:
