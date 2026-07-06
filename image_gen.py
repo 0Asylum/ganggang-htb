@@ -40,15 +40,9 @@ BLOOD_SIZE     = 45
 # bottom of machine area
 ICONS_Y = MACHINE_POS[1] + MACHINE_SIZE - ICON_SIZE + 3
 
-# The body line ("Just solved X" / "Just got root on X") sits at x=228 (same
-# column as the username) and must clear the box avatar at x=660 -- a 432px
-# column, minus a 16px safety margin. UbuntuMono-Regular is monospaced, so each
-# tier's max_chars is floor(416 / char_width_at_that_size), verified directly
-# against the font. Long challenge/machine names (e.g. "Social Media
-# Investigation Hub") shrink through these tiers before ever needing to
-# truncate, so the name stays fully readable in all but the most extreme case.
-# (size, max_chars) pairs, smallest-first fallback is the last entry -- text
-# still longer than that gets truncated with an ellipsis at that size.
+# (size, max_chars) tiers for the body line, largest-fits-first. max_chars is
+# how many characters fit before the box avatar at x=660; text past the
+# smallest tier gets truncated with an ellipsis.
 BODY_TEXT_FONT_TIERS = [
     (30, 27),
     (24, 34),
