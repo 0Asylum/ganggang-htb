@@ -762,7 +762,7 @@ async def cmd_claim_approve(message, data, api):
 
     if claim["discord_id"] == message.author.id and get_role(message) < ROLE_OWNER:
         await message.channel.send(
-            "You can't approve your own claim request -- ask another admin, or the owner, to review it.",
+            "You can't approve your own claim request.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return

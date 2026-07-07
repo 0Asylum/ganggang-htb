@@ -34,11 +34,18 @@ def init_logger():
     """Configures root logging: DEBUG for this app's own loggers, INFO for
     the noisier discord.py/asyncio loggers, all to stdout.
     """
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    file_handler = logging.FileHandler("bot.log")
+    file_handler.setFormatter(formatter)
+
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    root.addHandler(handler)
+    root.addHandler(stream_handler)
+    root.addHandler(file_handler)
     logging.getLogger("discord").setLevel(logging.INFO)
     logging.getLogger("asyncio").setLevel(logging.INFO)
 
@@ -110,6 +117,7 @@ async def on_message(message):
         return
 
     user_last_command[user_id] = now
+    logger.info(f"Command '{command}' run by {message.author} (id={user_id})")
     await handler(message, data, htb_api)
 
 
