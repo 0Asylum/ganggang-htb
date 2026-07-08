@@ -17,20 +17,18 @@ _htb_limiter = None
 _sync_worker = None
 _activity_poller = None
 
-# Entries older than this when first seen (e.g. the bot was offline for a
-# while and comes back to a backlog, or a purge triggers a history re-sync)
-# are recorded silently instead of announced, so a long gap doesn't spam a
-# wall of "new" pwns that actually happened days ago.
-ANNOUNCE_MAX_AGE = timedelta(hours=1)
-
-
-def _is_stale(entry, now):
-    """True if `entry`'s date is older than ANNOUNCE_MAX_AGE relative to `now`."""
+def _is_stale(entry, now, max_age):
+    """True if `entry`'s date is older than `max_age` relative to `now`. Entries
+    older than this when first seen (e.g. the bot was offline for a while and
+    comes back to a backlog, or a purge triggers a history re-sync) are recorded
+    silently instead of announced, so a long gap doesn't spam a wall of "new"
+    pwns that actually happened days ago. See config.announce_max_age.
+    """
     try:
         entry_date = datetime.fromisoformat(entry["date"].replace("Z", "+00:00"))
     except (ValueError, KeyError):
         return False
-    return (now - entry_date) > ANNOUNCE_MAX_AGE
+    return (now - entry_date) > max_age
 
 
 class _RateLimiter:
@@ -525,7 +523,8 @@ class TeamActivityPoller(BasePoller):
                 await self._cache_avatars(entry)
 
             now = datetime.now(timezone.utc)
-            announce_entries = [e for e in new_entries if not _is_stale(e, now)]
+            max_age = timedelta(seconds=cfg.announce_max_age)
+            announce_entries = [e for e in new_entries if not _is_stale(e, now, max_age)]
             stale_count = len(new_entries) - len(announce_entries)
             if stale_count:
                 logger.info(
