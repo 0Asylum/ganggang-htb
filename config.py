@@ -51,6 +51,11 @@ class Config:
     # 1 = enable EasterEggPoller (Kamigold randomly first-bloods root on Monteverde
     # every ~2-4 days, purely cosmetic, no DB writes). 0 = disable it entirely.
     funnymode: int = 1
+    # Solves older than this (in seconds) when first seen by TeamActivityPoller
+    # (e.g. after an extended outage) are recorded to the DB silently instead of
+    # announced, so a long gap doesn't spam a wall of "new" pwns that actually
+    # happened a while ago. See poller._is_stale.
+    announce_max_age: int = 86400
 
 
 def config_exists(filename):
