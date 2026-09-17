@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import logging
 
-from api_client import ApiClient
+from api_client import ApiClient, AuthenticationError
 import discord
 import commands
 from commands import COMMANDS
@@ -147,7 +147,13 @@ def main():
         base_url=cfg.htb_base_url, token=htb_token, user_agent=cfg.user_agent
     )
 
-    team_info = htb_api.get(f"team/info/{cfg.team_id}", api_version="v4")
+    try:
+        team_info = htb_api.get(f"team/info/{cfg.team_id}", api_version="v4")
+    except AuthenticationError:
+        # Continue connecting to Discord: the first poll will post the visible
+        # token warning in the configured channel.
+        team_info = None
+        logger.error("HTB API authentication failed during startup")
     if team_info and team_info.get("name"):
         config.set_team_name(team_info["name"])
         logger.info(f"Team name: {config.get_team_name()}")
