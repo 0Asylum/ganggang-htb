@@ -87,7 +87,8 @@ class Database:
                 user_bloods INTEGER DEFAULT 0,
                 challenge_owns INTEGER DEFAULT 0,
                 challenge_bloods INTEGER DEFAULT 0,
-                last_synced_at TEXT
+                last_synced_at TEXT,
+                is_team_member INTEGER NOT NULL DEFAULT 1
             )
             """,
             """
@@ -133,6 +134,25 @@ class Database:
                 name TEXT NOT NULL,
                 avatar_url TEXT,
                 total_flags INTEGER DEFAULT 0
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS seasons (
+                id INTEGER PRIMARY KEY,
+                number INTEGER UNIQUE,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                start_date TEXT,
+                end_date TEXT,
+                last_synced_at TEXT,
+                machines_synced_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS season_machines (
+                season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+                machine_id INTEGER NOT NULL,
+                PRIMARY KEY (season_id, machine_id)
             )
             """,
             """
@@ -227,6 +247,17 @@ class Database:
         if "tag" not in existing_cols:
             self._connection.execute("ALTER TABLE discord_users ADD COLUMN tag TEXT")
 
+        existing_user_cols = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(users)")
+        }
+        if "is_team_member" not in existing_user_cols:
+            # Existing rows all came from this team's activity feed, so preserve
+            # their old leaderboard eligibility until the first successful roster
+            # refresh can distinguish current members from former ones.
+            self._connection.execute(
+                "ALTER TABLE users ADD COLUMN is_team_member INTEGER NOT NULL DEFAULT 1"
+            )
+
         # Hard DB-level guarantee that an HTB profile can only ever be linked to one
         # Discord account -- a partial index (ignoring NULLs) so unclaimed rows don't
         # collide with each other. The one-discord-account-per-HTB-profile direction
@@ -277,6 +308,13 @@ class Database:
         row = cursor.fetchone()
         return row is not None and row["last_synced_at"] is not None
 
+    def is_team_member(self, user_id):
+        """True if the user is still present in the latest successful roster."""
+        row = self._connection.execute(
+            "SELECT is_team_member FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return row is not None and bool(row["is_team_member"])
+
     def upsert_user(self, profile):
         """Inserts or updates a user's basic HTB profile fields (name, avatar,
         rank, points, lifetime blood/own counts).
@@ -317,6 +355,75 @@ class Database:
         ))
         self._connection.commit()
 
+    def sync_team_roster(self, members):
+        """Reconciles stored users against an authoritative HTB team roster.
+
+        Stable HTB IDs make username changes an in-place update. Users absent
+        from the roster are purged with their history and account claims.
+        Returns added, renamed, and removed users for logging.
+        """
+        roster_ids = {member["id"] for member in members}
+        existing = {
+            row["id"]: row
+            for row in self._connection.execute("SELECT id, name FROM users")
+        }
+        added = []
+        renamed = []
+
+        self._connection.execute("UPDATE users SET is_team_member = 0")
+        for member in members:
+            previous = existing.get(member["id"])
+            if previous is None:
+                added.append({"id": member["id"], "name": member["name"]})
+            elif previous["name"] != member["name"]:
+                renamed.append({
+                    "id": member["id"],
+                    "old_name": previous["name"],
+                    "new_name": member["name"],
+                })
+            self._connection.execute("""
+                INSERT INTO users
+                    (id, name, avatar_url, rank, rank_id, country_code, points,
+                     system_owns, user_owns, system_bloods, user_bloods,
+                     is_team_member)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    avatar_url=COALESCE(excluded.avatar_url, users.avatar_url),
+                    rank=COALESCE(excluded.rank, users.rank),
+                    rank_id=COALESCE(excluded.rank_id, users.rank_id),
+                    country_code=COALESCE(excluded.country_code, users.country_code),
+                    points=COALESCE(excluded.points, users.points),
+                    system_owns=excluded.system_owns,
+                    user_owns=excluded.user_owns,
+                    system_bloods=excluded.system_bloods,
+                    user_bloods=excluded.user_bloods,
+                    is_team_member=1
+            """, (
+                member["id"],
+                member["name"],
+                member.get("avatar"),
+                member.get("rank_text"),
+                # team/members calls the global leaderboard position "rank";
+                # it is not the profile tier ID stored in users.rank_id.
+                member.get("rank_id"),
+                member.get("country_code"),
+                member.get("points"),
+                member.get("root_owns", 0),
+                member.get("user_owns", 0),
+                member.get("root_bloods_count", 0),
+                member.get("user_bloods_count", 0),
+            ))
+        self._connection.commit()
+
+        removed = []
+        for user_id in existing.keys() - roster_ids:
+            old_name = existing[user_id]["name"]
+            purge_result = self.purge_user(user_id)
+            removed.append({"id": user_id, "name": old_name, **purge_result})
+
+        return {"added": added, "renamed": renamed, "removed": removed}
+
     def mark_user_synced(self, user_id, timestamp):
         """Records when a user's full profile sync last completed."""
         self._connection.execute(
@@ -338,6 +445,69 @@ class Database:
             "SELECT * FROM users WHERE name = ? COLLATE NOCASE", (name,)
         )
         return cursor.fetchone()
+
+    # ── seasons ────────────────────────────────────────────────────────────────
+
+    def sync_seasons(self, seasons, timestamp):
+        """Upserts HTB season metadata, including public-number/internal-ID mapping."""
+        self._connection.execute("UPDATE seasons SET active = 0")
+        for season in seasons:
+            self._connection.execute("""
+                INSERT INTO seasons
+                    (id, number, name, active, start_date, end_date, last_synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    number=excluded.number,
+                    name=excluded.name,
+                    active=excluded.active,
+                    start_date=excluded.start_date,
+                    end_date=excluded.end_date,
+                    last_synced_at=excluded.last_synced_at
+            """, (
+                season["id"],
+                season.get("number"),
+                season["name"],
+                1 if season.get("active") else 0,
+                season.get("start_date"),
+                season.get("end_date"),
+                timestamp,
+            ))
+        self._connection.commit()
+
+    def sync_season_machines(self, season_id, machine_ids, timestamp):
+        """Replaces one season's persisted machine membership atomically."""
+        self._connection.execute(
+            "DELETE FROM season_machines WHERE season_id = ?", (season_id,)
+        )
+        self._connection.executemany(
+            "INSERT INTO season_machines (season_id, machine_id) VALUES (?, ?)",
+            ((season_id, machine_id) for machine_id in machine_ids),
+        )
+        self._connection.execute(
+            "UPDATE seasons SET machines_synced_at = ? WHERE id = ?",
+            (timestamp, season_id),
+        )
+        self._connection.commit()
+
+    def get_active_season(self):
+        """Returns the currently active season metadata row, if known."""
+        return self._connection.execute(
+            "SELECT * FROM seasons WHERE active = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    def get_season_by_number(self, number):
+        """Resolves a public season number to its persisted HTB metadata row."""
+        return self._connection.execute(
+            "SELECT * FROM seasons WHERE number = ?", (number,)
+        ).fetchone()
+
+    def get_season_machine_ids(self, season_id):
+        """Returns the persisted machine IDs belonging to one internal season ID."""
+        rows = self._connection.execute(
+            "SELECT machine_id FROM season_machines WHERE season_id = ?",
+            (season_id,),
+        ).fetchall()
+        return {row["machine_id"] for row in rows}
 
     # ── entity upserts ─────────────────────────────────────────────────────────
 
@@ -677,14 +847,19 @@ class Database:
             "fortresses": [dict(r) for r in fortresses],
         }
 
-    def get_leaderboard_points(self, limit=10):
-        """Top `limit` users by total HTB points."""
+    def get_leaderboard_points(self, since, limit=10):
+        """Top active current team members by total HTB points."""
         cursor = self._connection.execute("""
-            SELECT id, name, avatar_url, points FROM users
-            WHERE points IS NOT NULL
-            ORDER BY points DESC
+            SELECT u.id, u.name, u.avatar_url, u.points FROM users u
+            WHERE u.is_team_member = 1
+              AND u.points IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM team_activity t
+                  WHERE t.user_id = u.id AND t.date >= ?
+              )
+            ORDER BY u.points DESC
             LIMIT ?
-        """, (limit,))
+        """, (since, limit))
         return cursor.fetchall()
 
     def get_leaderboard_team_bloods(self, since, limit=10):
@@ -701,7 +876,7 @@ class Database:
                 SELECT user_id, own_date FROM user_sherlock_solves WHERE team_blood = 1
             ) b
             JOIN users u ON u.id = b.user_id
-            WHERE b.own_date >= ?
+            WHERE u.is_team_member = 1 AND b.own_date >= ?
             GROUP BY u.id, u.name, u.avatar_url
             ORDER BY blood_count DESC
             LIMIT ?
@@ -720,7 +895,8 @@ class Database:
             SELECT u.id, u.name, u.avatar_url, COUNT(*) AS blood_count
             FROM user_machine_solves s
             JOIN users u ON u.id = s.user_id
-            WHERE s.team_blood = 1 AND s.machine_id IN ({placeholders})
+            WHERE u.is_team_member = 1
+              AND s.team_blood = 1 AND s.machine_id IN ({placeholders})
             GROUP BY u.id, u.name, u.avatar_url
             ORDER BY blood_count DESC
             LIMIT ?
@@ -735,6 +911,7 @@ class Database:
             SELECT u.id, u.name, MAX(t.date) AS last_active
             FROM users u
             LEFT JOIN team_activity t ON t.user_id = u.id
+            WHERE u.is_team_member = 1
             GROUP BY u.id, u.name
             HAVING last_active IS NULL OR last_active < ?
             ORDER BY (last_active IS NULL) DESC, last_active ASC
@@ -1073,6 +1250,7 @@ class Database:
         tables = [
             "team_activity", "users", "discord_users", "claims",
             "machines", "challenges", "sherlocks", "prolabs", "fortresses",
+            "seasons", "season_machines",
             "user_machine_solves", "user_challenge_solves", "user_sherlock_solves",
             "user_prolab_progress", "user_fortress_progress",
         ]

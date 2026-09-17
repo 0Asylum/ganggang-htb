@@ -33,15 +33,16 @@ class Config:
     htb_rate_limit: int = 10
     # Discord messages per minute (paranoid)
     discord_rate_limit: int = 5
-    # Rolling window (days) for team-blood leaderboards (bloods/season). Points is exempt -- HTB computes that total itself.
+    # Rolling activity window (days) for leaderboard eligibility and team bloods.
+    # Lifetime stats and account claims are retained regardless of this window.
     leaderboard_window_days: int = 90
     # How often (seconds) TeamActivityPoller re-fetches team/activity from HTB. It also
-    # refreshes the season cache (season/list + season/machines) at the top of every poll
-    # whenever that cache is stale (see poller._SEASON_CACHE_TTL, currently 900s), so a
-    # single poll can cost up to 3 HTB calls, not just 1.
+    # refreshes the team roster and checks the season cache (season/list +
+    # season/machines) at the top of every poll. Whenever that cache is stale (see
+    # poller._SEASON_CACHE_TTL, currently 900s), one cycle can cost up to 4 HTB calls.
     #
-    # Recommended: keep this at least ~3x (60 / htb_rate_limit) -- e.g. with the default
-    # htb_rate_limit of 10/min (6s between calls), that floor is ~18s -- so one poll cycle
+    # Recommended: keep this at least ~4x (60 / htb_rate_limit) -- e.g. with the default
+    # htb_rate_limit of 10/min (6s between calls), that floor is ~24s -- so one poll cycle
     # always has room to finish its calls through the shared rate limiter before the next
     # one starts. Going much lower risks this poller monopolizing the limiter and starving
     # ProfileSyncWorker (which shares it). Going higher just delays how fast new pwns get

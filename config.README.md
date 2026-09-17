@@ -39,24 +39,26 @@ Restart the bot after editing any of these — nothing is hot-reloaded.
 ## Leaderboards
 
 - **`leaderboard_window_days`** (int, days) — rolling lookback window for
-  `!leaderboard bloods` and `!leaderboard season`. Both query "team bloods in the
-  last N days" and both show `Last N days` in the card subtitle, so the two always
-  stay in sync with whatever this is set to. `!leaderboard points` is **not**
-  affected — that's HTB's own all-time point total, computed on their end, no local
-  windowing involved.
+  leaderboard activity. `!leaderboard points` includes only current team members
+  with activity in this window, while still ranking them by HTB's all-time point
+  total. `!leaderboard bloods` counts team bloods in the same window, and the
+  season board includes current members with bloods on the current or explicitly
+  requested historical season's machines. This setting never removes profiles,
+  lifetime stats, or Discord account claims; those are removed only when a user
+  actually leaves the HTB team roster.
 
 ## Polling
 
 - **`poll_interval`** (int, seconds, default 600) — how often `TeamActivityPoller`
-  re-fetches `team/activity` from HTB. At the top of every poll it also checks the
-  season cache (`season/list` + `season/machines/{id}`, see `poller._SEASON_CACHE_TTL`,
-  currently 900s) and refreshes it first if stale — that ordering is deliberate, so a
-  season transition is always reflected before that same cycle's new solves get
-  tagged season/non-season. This means a single poll can cost up to **3** HTB calls
-  (season/list, season/machines, team/activity), not just 1.
+  refreshes the team roster and `team/activity` from HTB. At the top of every poll
+  it also checks the season cache (`season/list` + `season/machines/{id}`, see
+  `poller._SEASON_CACHE_TTL`, currently 900s) and refreshes it first if stale — that
+  ordering is deliberate, so a season transition is always reflected before that
+  same cycle's new solves get tagged season/non-season. A cycle can therefore cost
+  up to **4** HTB calls (season/list, season/machines, team/members, team/activity).
 
-  **Recommended floor:** at least `~3 * (60 / htb_rate_limit)` seconds — e.g. with
-  the default `htb_rate_limit` of 10/min (6s between calls), that's ~18s — so one
+  **Recommended floor:** at least `~4 * (60 / htb_rate_limit)` seconds — e.g. with
+  the default `htb_rate_limit` of 10/min (6s between calls), that's ~24s — so one
   poll's calls always finish clearing the shared rate limiter before the next poll
   starts.
 

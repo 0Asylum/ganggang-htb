@@ -22,7 +22,7 @@ COMMAND_HELP = [
     ("ping",         "!ping",                           "health check",                                ROLE_EVERYONE),
     ("version",      "!version",                        "show the bot's current version",             ROLE_EVERYONE),
     ("stats",        "!stats [profileID|name|@mention]", "show a member's HTB stats card (default: yourself, if claimed)", ROLE_EVERYONE),
-    ("leaderboard",  "!leaderboard [points|bloods|season]", "top 10 leaderboard (default: points)",     ROLE_EVERYONE),
+    ("leaderboard",  "!leaderboard [points|bloods|season [number]]", "top 10; points/bloods use configured window, season number is optional", ROLE_EVERYONE),
     ("help",         "!help",                           "show this message",                           ROLE_EVERYONE),
     ("syncqueue",    "!syncqueue",                      "show pending profile sync queue size",        ROLE_ADMIN),
     ("syncstatus",   "!syncstatus",                     "show profile sync worker status",             ROLE_ADMIN),
@@ -306,29 +306,31 @@ async def _leaderboard_rows(db_rows, value_key, guild):
 
 
 async def cmd_leaderboard(message, data, api):
-    """!leaderboard [points|bloods|season] -- posts a top-10 image for total
-    points, team bloods in the configured rolling window, or team bloods on
-    the current season's machines.
+    """!leaderboard [points|bloods|season [number]] -- posts an active-current-
+    member top 10 for total points, rolling team bloods, or team bloods on the
+    current/requested season's machines.
     """
-    mode = data.strip().lower() or "points"
+    args = data.strip().lower().split()
+    mode = args[0] if args else "points"
     db = database.get()
+    window_days = config.get().leaderboard_window_days
+    since = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
 
-    if mode in ("points", "point", "pts"):
-        db_rows = db.get_leaderboard_points(limit=10)
+    if mode in ("points", "point", "pts") and len(args) <= 1:
+        db_rows = db.get_leaderboard_points(since, limit=10)
         rows = await _leaderboard_rows(db_rows, "points", message.guild)
         if not rows:
             await message.channel.send("No data yet.")
             return
         buf = image_gen.generate_leaderboard_image(
-            "TOP 10 — POINTS", "HTB Points", rows, image_gen.HTB_GREEN, "pts",
+            "TOP 10 — POINTS", f"Active in last {window_days} days", rows,
+            image_gen.HTB_GREEN, "pts",
             team_name=config.get_team_name(),
         )
         await message.channel.send(file=discord.File(buf, "leaderboard_points.png"))
-    elif mode in ("bloods", "blood", "teamblood", "teambloods"):
-        window_days = config.get().leaderboard_window_days
-        since = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime(
-            "%Y-%m-%dT%H:%M:%S.000Z"
-        )
+    elif mode in ("bloods", "blood", "teamblood", "teambloods") and len(args) <= 1:
         db_rows = db.get_leaderboard_team_bloods(since, limit=10)
         rows = await _leaderboard_rows(db_rows, "blood_count", message.guild)
         if not rows:
@@ -340,12 +342,37 @@ async def cmd_leaderboard(message, data, api):
             team_name=config.get_team_name(),
         )
         await message.channel.send(file=discord.File(buf, "leaderboard_bloods.png"))
-    elif mode in ("season", "seasonal"):
-        season_id, season_name, machine_ids = await poller.get_current_season_machines(api)
-        if not machine_ids:
-            await message.channel.send(
-                "Couldn't determine the current season's machines right now. Try again shortly."
+    elif mode in ("season", "seasonal") and len(args) <= 2:
+        season_number = None
+        if len(args) == 2:
+            if not args[1].isdigit() or int(args[1]) <= 0:
+                await message.channel.send(
+                    "Usage: !leaderboard season [number]",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            season_number = int(args[1])
+
+        if season_number is None:
+            season_id, season_name, machine_ids = await poller.get_current_season_machines(api)
+        else:
+            season_id, season_name, machine_ids = await poller.get_numbered_season_machines(
+                api, season_number
             )
+
+        if season_id is None:
+            target = "the current season" if season_number is None else f"Season {season_number}"
+            await message.channel.send(
+                f"Couldn't find {target}. Try again shortly."
+            )
+            return
+        if machine_ids is None:
+            await message.channel.send(
+                f"Couldn't load {season_name}'s machines right now. Try again shortly."
+            )
+            return
+        if not machine_ids:
+            await message.channel.send(f"{season_name} has no machines yet.")
             return
         db_rows = db.get_leaderboard_season_bloods(machine_ids, limit=10)
         rows = await _leaderboard_rows(db_rows, "blood_count", message.guild)
@@ -360,7 +387,7 @@ async def cmd_leaderboard(message, data, api):
         await message.channel.send(file=discord.File(buf, "leaderboard_season.png"))
     else:
         await message.channel.send(
-            "Usage: !leaderboard [points|bloods|season]",
+            "Usage: !leaderboard [points|bloods|season [number]]",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
