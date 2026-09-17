@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -90,6 +91,52 @@ _SEASON_CACHE_TTL = 900  # 15 minutes -- max age before get_current_season_machi
 _season_cache = {"season_id": None, "season_name": None, "machine_ids": None, "fetched_at": None}
 
 
+def _public_season_number(season):
+    """Extracts the user-facing season number from HTB season metadata."""
+    match = re.fullmatch(r"Season\s+(\d+)", season.get("name", ""), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    # HTB named its first three entries Open Beta Season I/II/III; their
+    # internal IDs are also their public ordinal immediately before Season 4.
+    if season.get("name", "").startswith("Open Beta Season") and season.get("id") in (1, 2, 3):
+        return season["id"]
+    return None
+
+
+async def _refresh_season_catalog(htb_api):
+    """Fetches and persists HTB's public-season-number/internal-ID mapping."""
+    await _get_htb_limiter().acquire()
+    result = await asyncio.to_thread(htb_api.get, "season/list", api_version="v4")
+    if not result:
+        logger.warning("Failed to fetch season/list")
+        return None
+
+    seasons = []
+    for raw in result.get("data", []):
+        season = dict(raw)
+        season["number"] = _public_season_number(raw)
+        seasons.append(season)
+    database.get().sync_seasons(seasons, datetime.now(timezone.utc).isoformat())
+    return seasons
+
+
+async def _refresh_one_season_machines(htb_api, season_id):
+    """Fetches and persists one internal season ID's machine membership."""
+    await _get_htb_limiter().acquire()
+    result = await asyncio.to_thread(
+        htb_api.get, f"season/machines/{season_id}", api_version="v4"
+    )
+    if not result:
+        logger.warning(f"Failed to fetch season/machines/{season_id}")
+        return None
+
+    machine_ids = {m["id"] for m in result.get("data", []) if "id" in m}
+    database.get().sync_season_machines(
+        season_id, machine_ids, datetime.now(timezone.utc).isoformat()
+    )
+    return machine_ids
+
+
 async def _refresh_season_cache(htb_api):
     """Unconditionally re-fetches the active season and its machine list from HTB
     and updates the module-level cache. Called from get_current_season_machines()
@@ -98,13 +145,11 @@ async def _refresh_season_cache(htb_api):
     """
     now = asyncio.get_event_loop().time()
 
-    await _get_htb_limiter().acquire()
-    seasons = await asyncio.to_thread(htb_api.get, "season/list", api_version="v4")
-    if not seasons:
-        logger.warning("Failed to fetch season/list")
+    seasons = await _refresh_season_catalog(htb_api)
+    if seasons is None:
         return
 
-    active = next((s for s in seasons.get("data", []) if s.get("active")), None)
+    active = next((s for s in seasons if s.get("active")), None)
     if active is None:
         logger.warning("No active season found in season/list")
         return
@@ -112,13 +157,19 @@ async def _refresh_season_cache(htb_api):
     season_id = active["id"]
     season_name = active["name"]
 
-    await _get_htb_limiter().acquire()
-    result = await asyncio.to_thread(htb_api.get, f"season/machines/{season_id}", api_version="v4")
-    if not result:
-        logger.warning(f"Failed to fetch season/machines/{season_id}")
+    machine_ids = await _refresh_one_season_machines(htb_api, season_id)
+    if machine_ids is None:
+        # The catalog may already have advanced to a new active season even if
+        # its machine request failed. Switch identity immediately and fall back
+        # to whatever membership was last persisted for that season, but leave
+        # fetched_at unset so the next call retries the API.
+        _season_cache.update({
+            "season_id": season_id,
+            "season_name": season_name,
+            "machine_ids": database.get().get_season_machine_ids(season_id),
+            "fetched_at": None,
+        })
         return
-
-    machine_ids = {m["id"] for m in result.get("data", []) if "id" in m}
 
     _season_cache.update({
         "season_id": season_id,
@@ -144,7 +195,46 @@ async def get_current_season_machines(htb_api):
     fetched_at = _season_cache["fetched_at"]
     if fetched_at is None or now - fetched_at >= _SEASON_CACHE_TTL:
         await _refresh_season_cache(htb_api)
+    if _season_cache["season_id"] is None:
+        # Persisted data keeps the command useful across a restart or temporary
+        # HTB API failure even before the in-memory cache has refreshed.
+        season = database.get().get_active_season()
+        if season is not None:
+            return (
+                season["id"],
+                season["name"],
+                database.get().get_season_machine_ids(season["id"]),
+            )
     return _season_cache["season_id"], _season_cache["season_name"], _season_cache["machine_ids"]
+
+
+async def get_numbered_season_machines(htb_api, season_number):
+    """Returns (internal ID, name, machine IDs) for a public season number.
+
+    Historical machine membership is served from SQLite after its first fetch;
+    the active season continues through the normal 15-minute refresh path.
+    A None machine-ID value means the API fetch failed, while an empty set is a
+    valid season that has not published machines yet.
+    """
+    db = database.get()
+    season = db.get_season_by_number(season_number)
+    if season is None:
+        if await _refresh_season_catalog(htb_api) is None:
+            return None, None, None
+        season = db.get_season_by_number(season_number)
+    if season is None:
+        return None, None, None
+
+    if season["active"]:
+        return await get_current_season_machines(htb_api)
+
+    if season["machines_synced_at"] is None:
+        machine_ids = await _refresh_one_season_machines(htb_api, season["id"])
+        if machine_ids is None:
+            return season["id"], season["name"], None
+    else:
+        machine_ids = db.get_season_machine_ids(season["id"])
+    return season["id"], season["name"], machine_ids
 
 
 class BasePoller:
@@ -434,6 +524,38 @@ class TeamActivityPoller(BasePoller):
             _, _, season_machine_ids = await get_current_season_machines(htb_api)
             season_machine_ids = season_machine_ids or set()
 
+            self._set_status("fetching team roster")
+            roster = await self.htb_get(
+                htb_api,
+                f"team/members/{cfg.team_id}",
+                api_version="v4",
+            )
+            roster_ids = None
+            if isinstance(roster, list) and roster:
+                self._set_status("reconciling team roster")
+                roster_result = db.sync_team_roster(roster)
+                roster_ids = {member["id"] for member in roster}
+
+                for change in roster_result["renamed"]:
+                    logger.info(
+                        "HTB username changed for user %s: %s -> %s",
+                        change["id"], change["old_name"], change["new_name"],
+                    )
+                for change in roster_result["removed"]:
+                    logger.info(
+                        "Purged departed team member %s (id=%s)",
+                        change["name"], change["id"],
+                    )
+                if worker:
+                    for member in roster:
+                        if not db.user_synced(member["id"]):
+                            worker.enqueue(member["id"])
+            else:
+                # A real team always has at least its captain. Treat an empty or
+                # failed response as non-authoritative so it can never purge all
+                # locally stored users during a transient HTB API problem.
+                logger.warning("Team roster fetch failed or returned empty; skipping reconciliation")
+
             self._set_status("fetching team activity")
             result = await self.htb_get(
                 htb_api,
@@ -446,6 +568,11 @@ class TeamActivityPoller(BasePoller):
                 return
 
             entries = [self._parse_entry(r) for r in result]
+            if roster_ids is not None:
+                # team/activity is a rolling historical feed and can retain a
+                # departed member's old solves. Never let those rows recreate a
+                # user that authoritative roster reconciliation just purged.
+                entries = [entry for entry in entries if entry["user_id"] in roster_ids]
 
             # Per-cycle cache so a machine referenced by many entries in this same
             # batch (e.g. a from-scratch rebuild pulling the full 90-day window, where
@@ -683,12 +810,24 @@ class ProfileSyncWorker:
         self._current_user = user_id
         logger.info(f"Starting profile sync for user {user_id}")
 
+        def still_on_team():
+            if db.is_team_member(user_id):
+                return True
+            logger.info(f"Stopping profile sync for departed user {user_id}")
+            return False
+
+        # Roster reconciliation may have purged this user after they were queued.
+        if not still_on_team():
+            return False
+
         self._set_step("basic profile")
         result = await self._htb_get(
             htb_api, f"user/profile/basic/{user_id}", api_version="v4"
         )
         if not result:
             logger.warning(f"Could not fetch basic profile for user {user_id}")
+            return False
+        if not still_on_team():
             return False
         profile = result.get("profile", {})
         db.upsert_user(profile)
@@ -698,8 +837,12 @@ class ProfileSyncWorker:
         result = await self._htb_get(
             htb_api, f"user/profile/progress/prolab/{user_id}", api_version="v4"
         )
+        if not still_on_team():
+            return False
         if result:
             for lab in result.get("profile", {}).get("prolabs", []):
+                if not still_on_team():
+                    return False
                 db.upsert_prolab(
                     lab["id"], lab["name"],
                     avatar_url=lab.get("avatar"),
@@ -719,8 +862,12 @@ class ProfileSyncWorker:
         result = await self._htb_get(
             htb_api, f"user/profile/progress/fortress/{user_id}", api_version="v4"
         )
+        if not still_on_team():
+            return False
         if result:
             for fort in result.get("profile", {}).get("fortresses", []):
+                if not still_on_team():
+                    return False
                 db.upsert_fortress(
                     fort["id"], fort["name"],
                     avatar_url=fort.get("avatar"),
@@ -743,12 +890,16 @@ class ProfileSyncWorker:
                 api_version="v5",
                 params={"per_page": 100, "page": page},
             )
+            if not still_on_team():
+                return False
             if not result:
                 break
 
             last_page = result.get("meta", {}).get("lastPage", 1)
             self._set_step(f"activity page {page}/{last_page}")
             for item in result.get("data", []):
+                if not still_on_team():
+                    return False
                 item_type = item.get("type")
                 item_id = item.get("id")
                 name = item.get("name")
@@ -779,6 +930,8 @@ class ProfileSyncWorker:
                 break
             page += 1
 
+        if not still_on_team():
+            return False
         db.mark_user_synced(user_id, datetime.now(timezone.utc).isoformat())
         logger.info(f"Profile sync complete for user {user_id}")
         return True

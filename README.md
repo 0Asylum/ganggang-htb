@@ -27,9 +27,21 @@ fortresses.
 
 ![stats card example](docs/screenshots/stats_card.png)
 
-**`!leaderboard [points|bloods|season]`** -- posts a top-10 image ranked by
-total points, team bloods in a rolling window, or team bloods on the current
-season's machines.
+**`!leaderboard [points|bloods|season [number]]`** -- posts a top-10 image for
+active, current team members, ranked by total points, team bloods in a rolling
+window, or team bloods on the current or requested historical season's machines.
+Inactive profiles remain available to `!stats` and the account-linking system.
+Profiles are removed only when their immutable HTB user ID disappears from the
+current team roster; username changes update that same profile in place.
+
+- `!leaderboard` or `!leaderboard points` ranks eligible members by all-time HTB
+  points, but eligibility requires activity within `leaderboard_window_days`
+  (90 days by default).
+- `!leaderboard bloods` counts team bloods earned within the same configurable
+  rolling window.
+- `!leaderboard season` uses the active season; `!leaderboard season 11` selects
+  a historical season by its public number. Season boards do not use the rolling
+  activity window.
 
 ![leaderboard example](docs/screenshots/leaderboard_points.png)
 
@@ -45,7 +57,7 @@ cards (`!preference`) and set a short tag (`!tag`).
 | `!ganggang` | gang gang | everyone |
 | `!ping` | health check | everyone |
 | `!stats [profileID\|name\|@mention]` | show a member's HTB stats card (default: yourself, if claimed) | everyone |
-| `!leaderboard [points\|bloods\|season]` | top 10 leaderboard (default: points) | everyone |
+| `!leaderboard [points\|bloods\|season [number]]` | top 10; points/bloods use the configured window, optional season number selects history | everyone |
 | `!help` / `!help2` | list commands available to you | everyone |
 | `!claim <profileID\|name>` | request to link your Discord account to one HTB profile | everyone |
 | `!preference <htb\|discord>` | choose which avatar shows for you | everyone |
