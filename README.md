@@ -81,6 +81,11 @@ your own bot token, test server, and HTB API token to run this against --
 you'll need your own of each, since this repo's production credentials
 aren't (and never will be) checked in.
 
+If HTB rejects the configured API token with HTTP 401, the bot stays connected
+to Discord and posts one warning in its configured announcement channel. Update
+`HTB_TOKEN` in `.env` and restart the bot; environment tokens are loaded only at
+startup.
+
 ## Contributing
 
 Bug fixes and features are welcome. Branch off `main`, open a PR when ready,

@@ -9,6 +9,7 @@ import database
 import cache
 import image_gen
 import poller
+from api_client import AuthenticationError
 
 logger = logging.getLogger(__name__)
 
@@ -353,12 +354,19 @@ async def cmd_leaderboard(message, data, api):
                 return
             season_number = int(args[1])
 
-        if season_number is None:
-            season_id, season_name, machine_ids = await poller.get_current_season_machines(api)
-        else:
-            season_id, season_name, machine_ids = await poller.get_numbered_season_machines(
-                api, season_number
-            )
+        try:
+            if season_number is None:
+                season_id, season_name, machine_ids = await poller.get_current_season_machines(api)
+            else:
+                season_id, season_name, machine_ids = await poller.get_numbered_season_machines(
+                    api, season_number
+                )
+        except AuthenticationError:
+            channel = None
+            if message.guild is not None:
+                channel = message.guild.get_channel(config.get().channel_id)
+            await poller.notify_htb_auth_failure(channel=channel or message.channel)
+            return
 
         if season_id is None:
             target = "the current season" if season_number is None else f"Season {season_number}"

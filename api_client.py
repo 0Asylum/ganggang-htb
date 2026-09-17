@@ -11,6 +11,11 @@ class RateLimitError(Exception):
     pass
 
 
+class AuthenticationError(Exception):
+    """Raised when HTB rejects the configured API token with HTTP 401."""
+    pass
+
+
 class ApiClient:
     """Thin wrapper around a requests.Session for calling HTB's API: builds
     versioned URLs, attaches auth/user-agent headers, and normalizes error
@@ -56,9 +61,9 @@ class ApiClient:
                 headers=None, base_url=None):
         """Issues an HTTP request and returns the parsed JSON body, an empty
         dict for an empty response, or None on any failure (HTTP error,
-        network error, or non-JSON body) -- except a 429, which raises
-        RateLimitError instead of returning None, since that needs different
-        handling (backoff) from a genuine failure.
+        network error, or non-JSON body) -- except 401 and 429 responses, which
+        raise dedicated errors because an expired/revoked token and rate limiting
+        need different handling from ordinary failures.
         """
         url = self._build_url(path, api_version, base_url=base_url)
         try:
@@ -72,7 +77,11 @@ class ApiClient:
             )
             response.raise_for_status()
         except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 429:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 401:
+                logger.error(f"{method.upper()} {url} unauthorized (401)")
+                raise AuthenticationError(url) from exc
+            if status == 429:
                 logger.warning(f"{method.upper()} {url} rate limited (429)")
                 raise RateLimitError(url) from exc
             logger.error(f"{method.upper()} {url} failed: {exc}")

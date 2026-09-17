@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import discord
 import database
 from database import SHERLOCK_CATEGORIES
-from api_client import RateLimitError
+from api_client import AuthenticationError, RateLimitError
 import config
 import cache
 import image_gen
@@ -17,6 +17,30 @@ logger = logging.getLogger(__name__)
 _htb_limiter = None
 _sync_worker = None
 _activity_poller = None
+_auth_warning_sent = False
+
+
+async def notify_htb_auth_failure(client=None, channel=None):
+    """Posts one per-process warning when HTB rejects the configured token."""
+    global _auth_warning_sent
+    if _auth_warning_sent:
+        return
+    if channel is None and client is not None:
+        channel = client.get_channel(config.get().channel_id)
+    if channel is None:
+        logger.error("HTB API authentication failed, but the alert channel is unavailable")
+        return
+
+    _auth_warning_sent = True
+    try:
+        await channel.send(
+            "WARNING: HTB API authentication failed (401).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception as exc:
+        _auth_warning_sent = False
+        logger.error(f"Failed to post HTB authentication warning: {exc}")
+
 
 def _is_stale(entry, now, max_age):
     """True if `entry`'s date is older than `max_age` relative to `now`. Entries
@@ -266,6 +290,9 @@ class BasePoller:
         while not client.is_closed():
             try:
                 await self.poll(client, htb_api)
+            except AuthenticationError:
+                logger.error(f"{self.__class__.__name__}: HTB API authentication failed")
+                await notify_htb_auth_failure(client=client)
             except Exception as e:
                 logger.error(f"{self.__class__.__name__} error: {e}")
             await asyncio.sleep(self.interval)
@@ -952,11 +979,15 @@ class ProfileSyncWorker:
             try:
                 user_id = await asyncio.wait_for(self._queue.get(), timeout=5.0)
                 rate_limited = False
+                auth_failed = False
                 try:
                     await self.sync_user(user_id, htb_api)
                 except RateLimitError:
                     rate_limited = True
                     logger.warning(f"Rate limited while syncing user {user_id} -- backing off 5 min")
+                except AuthenticationError:
+                    auth_failed = True
+                    logger.error(f"HTB API authentication failed while syncing user {user_id}")
                 except Exception as e:
                     logger.error(f"Profile sync failed for user {user_id}: {e}")
                 finally:
@@ -970,6 +1001,10 @@ class ProfileSyncWorker:
                     await self._notify(client, f"WARNING: Possible HTB rate limit hit while syncing user {user_id}. Backing off for 5 minutes.")
                     await asyncio.sleep(300)
                     self._current_step = None
+                    self.enqueue(user_id)
+                elif auth_failed:
+                    await notify_htb_auth_failure(client=client)
+                    await asyncio.sleep(300)
                     self.enqueue(user_id)
 
             except asyncio.TimeoutError:
