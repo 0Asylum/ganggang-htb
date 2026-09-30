@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _htb_limiter = None
 _sync_worker = None
 _activity_poller = None
+_profile_activity_poller = None
 _auth_warning_sent = False
 
 
@@ -109,6 +110,17 @@ def set_activity_poller(poller_instance):
     """
     global _activity_poller
     _activity_poller = poller_instance
+
+
+def get_profile_activity_poller():
+    """Returns the incremental ProfileActivityPoller, or None if not set."""
+    return _profile_activity_poller
+
+
+def set_profile_activity_poller(poller_instance):
+    """Registers the incremental profile-activity poller for status commands."""
+    global _profile_activity_poller
+    _profile_activity_poller = poller_instance
 
 
 _SEASON_CACHE_TTL = 900  # 15 minutes -- max age before get_current_season_machines() re-fetches
@@ -428,6 +440,56 @@ async def _resolve_machine_avatar(htb_api, machine_id):
     return result.get("info", {}).get("avatar")
 
 
+def _parse_profile_activity_date(value):
+    """Parses an HTB profile activity timestamp for cursor comparisons."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        logger.warning("Ignoring malformed profile activity timestamp %r", value)
+        return None
+
+
+def _upsert_profile_activity_item(db, user_id, item):
+    """Upserts one supported v5 profile/activity item into the lifetime solve
+    tables. Returns True for a supported, valid solve and False for activity
+    types this bot does not track or malformed entries.
+    """
+    item_type = item.get("type")
+    category = item.get("categoryName")
+    if item_type not in ("user", "root", "challenge", "sherlock"):
+        return False
+
+    item_id = item.get("id")
+    name = item.get("name")
+    own_date = item.get("ownDate")
+    if item_id is None or not name or not own_date:
+        logger.warning(
+            "Skipping malformed %s profile activity for user %s: id=%r name=%r ownDate=%r",
+            item_type, user_id, item_id, name, own_date,
+        )
+        return False
+
+    avatar = item.get("avatar")
+    blood = item.get("blood", False)
+    points = item.get("points", 0)
+
+    if item_type in ("user", "root"):
+        db.upsert_machine(item_id, name, avatar_url=avatar)
+        db.upsert_machine_solve(user_id, item_id, item_type, own_date, blood, points)
+    elif item_type == "sherlock" or category in SHERLOCK_CATEGORIES:
+        db.upsert_sherlock(item_id, name, avatar_url=avatar, category=category)
+        db.upsert_sherlock_solve(user_id, item_id, own_date, blood, points)
+    else:
+        db.upsert_challenge(item_id, name, avatar_url=avatar, category=category)
+        db.upsert_challenge_solve(user_id, item_id, own_date, blood, points)
+    return True
+
+
 class TeamActivityPoller(BasePoller):
     """Polls HTB's team activity feed, records new solves, resolves any
     missing avatars, and posts pwn-alert cards for anything new.
@@ -705,6 +767,138 @@ class TeamActivityPoller(BasePoller):
             self._set_status("idle")
 
 
+class ProfileActivityPoller(BasePoller):
+    """Incrementally reconciles one current member's v5 profile activity per
+    cycle. This fills the lifetime solve tables for activity omitted from the
+    team feed (notably Sherlocks) without repeatedly pulling full profiles.
+
+    Rotation state and the activity cursor live on the users table, so process
+    restarts and interrupted checks safely resume at the oldest member.
+    """
+
+    def __init__(self):
+        self.interval = config.get().profile_activity_poll_interval
+        self._status = "idle"
+
+    def _set_status(self, status):
+        self._status = status
+        logger.debug("ProfileActivityPoller: %s", status)
+
+    def status(self):
+        """Returns a one-line description for !syncqueue/!syncstatus."""
+        return self._status
+
+    async def poll(self, client, htb_api):
+        """Checks the least-recently reconciled fully-synced team member."""
+        db = database.get()
+        worker = get_sync_worker()
+        if worker is not None and worker.is_busy():
+            self._set_status("waiting for full profile syncs")
+            return False
+
+        user = db.get_next_profile_activity_user()
+        if user is None:
+            self._set_status("idle; no fully-synced members")
+            return False
+
+        user_id = user["id"]
+        user_name = user["name"]
+        cursor_raw = user["profile_activity_cursor_at"]
+        cursor_date = _parse_profile_activity_date(cursor_raw)
+        newest_raw = cursor_raw
+        newest_date = cursor_date
+        processed = 0
+        page = 1
+
+        self._set_status(f"checking {user_name} ({user_id}), page 1")
+        while True:
+            result = await self.htb_get(
+                htb_api,
+                f"user/profile/activity/{user_id}",
+                api_version="v5",
+                params={"per_page": 100, "page": page},
+            )
+            if not db.is_team_member(user_id):
+                logger.info(
+                    "Stopping incremental profile activity check for departed user %s",
+                    user_id,
+                )
+                return False
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                logger.warning(
+                    "Incremental profile activity check returned invalid data for user %s",
+                    user_id,
+                )
+                return False
+
+            last_page = result.get("meta", {}).get("lastPage", 1)
+            try:
+                last_page = int(last_page)
+            except (TypeError, ValueError):
+                last_page = 1
+
+            crossed_cursor = False
+            for item in result["data"]:
+                item_raw = item.get("ownDate")
+                item_date = _parse_profile_activity_date(item_raw)
+                if item_date is not None and (
+                    newest_date is None or item_date > newest_date
+                ):
+                    newest_date = item_date
+                    newest_raw = item_raw
+
+                # Activity is newest-first. Reprocess equal timestamps because
+                # multiple solves can share one timestamp; their DB keys make
+                # that replay idempotent. The first strictly older item proves
+                # we have crossed the durable cursor.
+                if cursor_date is not None and item_date is not None and item_date < cursor_date:
+                    crossed_cursor = True
+                    break
+
+                if _upsert_profile_activity_item(db, user_id, item):
+                    processed += 1
+
+            db.commit()
+            if crossed_cursor or page >= last_page:
+                break
+            page += 1
+            self._set_status(f"checking {user_name} ({user_id}), page {page}")
+
+        checked_at = datetime.now(timezone.utc).isoformat()
+        db.mark_profile_activity_checked(user_id, checked_at, newest_raw)
+        logger.info(
+            "Incremental profile activity check complete for %s (id=%s): "
+            "%s page(s), %s current item(s) processed",
+            user_name, user_id, page, processed,
+        )
+        return True
+
+    async def start(self, client, htb_api):
+        """Runs after each configured delay so the normal team roster/activity
+        cycle gets startup priority. A disabled interval (<= 0) starts no loop.
+        """
+        await client.wait_until_ready()
+        if self.interval <= 0:
+            self._set_status("disabled")
+            logger.info("ProfileActivityPoller: disabled by config")
+            return
+
+        while not client.is_closed():
+            await asyncio.sleep(self.interval)
+            try:
+                await self.poll(client, htb_api)
+            except AuthenticationError:
+                logger.error("ProfileActivityPoller: HTB API authentication failed")
+                await notify_htb_auth_failure(client=client)
+            except RateLimitError:
+                logger.warning("ProfileActivityPoller: HTB API rate limited; retrying next cycle")
+            except Exception as exc:
+                logger.error("ProfileActivityPoller error: %s", exc)
+            finally:
+                if self._status not in ("disabled", "idle; no fully-synced members"):
+                    self._set_status("idle")
+
+
 class EasterEggPoller:
     """Inside joke carried over from the bot this one replaced: its DB tracking was
     broken in a way that made it repeatedly announce Kamigold first-blooding root on
@@ -792,11 +986,16 @@ class ProfileSyncWorker:
         self._current_step = None
 
     def enqueue(self, user_id):
-        """Queues a user for sync, unless they're already queued."""
+        """Queues a user for sync unless already queued, returning whether the
+        queue changed. last_synced_at is deliberately not checked here so an
+        explicit resync can replay an existing profile.
+        """
         if user_id not in self._queued:
             self._queued.add(user_id)
             self._queue.put_nowait(user_id)
             logger.info(f"Queued profile sync for user {user_id}")
+            return True
+        return False
 
     def force_enqueue(self, user_id):
         """Queues a user for sync even if they're already queued (used to
@@ -808,6 +1007,10 @@ class ProfileSyncWorker:
     def queue_size(self):
         """Number of users currently waiting to be synced."""
         return self._queue.qsize()
+
+    def is_busy(self):
+        """True while a full profile is syncing or another is queued."""
+        return self._current_user is not None or not self._queue.empty()
 
     def status(self):
         """Live one-line status: idle-with-queue-size, or which user/step is
@@ -909,6 +1112,8 @@ class ProfileSyncWorker:
             db.commit()
 
         page = 1
+        newest_activity_raw = None
+        newest_activity_date = None
         while True:
             self._set_step(f"activity page {page}/?")
             result = await self._htb_get(
@@ -919,35 +1124,24 @@ class ProfileSyncWorker:
             )
             if not still_on_team():
                 return False
-            if not result:
-                break
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                logger.warning(f"Could not fetch profile activity for user {user_id}")
+                return False
 
             last_page = result.get("meta", {}).get("lastPage", 1)
             self._set_step(f"activity page {page}/{last_page}")
             for item in result.get("data", []):
                 if not still_on_team():
                     return False
-                item_type = item.get("type")
-                item_id = item.get("id")
-                name = item.get("name")
+                item_raw = item.get("ownDate")
+                item_date = _parse_profile_activity_date(item_raw)
+                if item_date is not None and (
+                    newest_activity_date is None or item_date > newest_activity_date
+                ):
+                    newest_activity_date = item_date
+                    newest_activity_raw = item_raw
                 avatar = item.get("avatar")
-                own_date = item.get("ownDate")
-                blood = item.get("blood", False)
-                points = item.get("points", 0)
-                category = item.get("categoryName")
-
-                if item_type in ("user", "root"):
-                    db.upsert_machine(item_id, name, avatar_url=avatar)
-                    db.upsert_machine_solve(
-                        user_id, item_id, item_type, own_date, blood, points
-                    )
-                elif item_type == "challenge":
-                    if category in SHERLOCK_CATEGORIES:
-                        db.upsert_sherlock(item_id, name, avatar_url=avatar, category=category)
-                        db.upsert_sherlock_solve(user_id, item_id, own_date, blood, points)
-                    else:
-                        db.upsert_challenge(item_id, name, avatar_url=avatar, category=category)
-                        db.upsert_challenge_solve(user_id, item_id, own_date, blood, points)
+                _upsert_profile_activity_item(db, user_id, item)
                 await cache.get_avatar(avatar)
 
             db.commit()
@@ -959,7 +1153,11 @@ class ProfileSyncWorker:
 
         if not still_on_team():
             return False
-        db.mark_user_synced(user_id, datetime.now(timezone.utc).isoformat())
+        db.mark_user_synced(
+            user_id,
+            datetime.now(timezone.utc).isoformat(),
+            activity_cursor=newest_activity_raw,
+        )
         logger.info(f"Profile sync complete for user {user_id}")
         return True
 

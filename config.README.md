@@ -62,12 +62,28 @@ Restart the bot after editing any of these — nothing is hot-reloaded.
   poll's calls always finish clearing the shared rate limiter before the next poll
   starts.
 
-  **Why not go lower:** this poller and `ProfileSyncWorker` (which resyncs a user's
-  full profile/history after a purge or a first-time-seen user) share the same rate
-  limiter. If `TeamActivityPoller` polls too aggressively it monopolizes the
-  limiter and profile syncs get starved out, queuing up indefinitely.
+  **Why not go lower:** this poller and `ProfileSyncWorker` (which syncs a user's
+  full profile/history when first seen, after leaving and rejoining, or when the
+  owner runs `!resync`) share the same rate limiter. If `TeamActivityPoller` polls
+  too aggressively it monopolizes the limiter and profile syncs get starved out,
+  queuing up indefinitely.
 
   **Why not worry about going higher:** no data is ever lost by polling less often
   — HTB's `team/activity` endpoint returns a 90-day window every time, so anything
   missed on one poll gets picked up on the next regardless of interval. A higher
   value only delays how quickly new pwns get announced in Discord.
+
+- **`profile_activity_poll_interval`** (int, seconds, default 600) — how often
+  `ProfileActivityPoller` reconciles one current, fully-synced member's v5
+  profile activity. This is separate from `team/activity` because the team feed
+  does not expose Sherlock solves. Members are selected oldest-check-first from
+  timestamps persisted in SQLite, so the rotation survives restarts. With 24
+  members at the default interval, each member is checked about every four
+  hours (144 lightweight checks per day across the whole team).
+
+  The poller normally needs one API request: it stops when it reaches the
+  member's stored activity cursor and fetches more pages only if over 100 newer
+  activity entries accumulated. It yields while any full-profile sync is queued
+  or running so `!resync` and first-time member imports take priority. Set this
+  value to `0` to disable incremental reconciliation; doing so means new
+  Sherlock solves will not reach `!stats` until a manual/full profile resync.

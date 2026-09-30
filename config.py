@@ -57,6 +57,12 @@ class Config:
     # announced, so a long gap doesn't spam a wall of "new" pwns that actually
     # happened a while ago. See poller._is_stale.
     announce_max_age: int = 86400
+    # How often to reconcile one current member's incremental v5 profile
+    # activity. HTB's team feed omits Sherlocks, so this durable round-robin
+    # catches them without repeatedly fetching every member's full profile.
+    # With 24 members and the default 600s interval, each member is checked
+    # about every four hours. Set to 0 to disable.
+    profile_activity_poll_interval: int = 600
 
 
 def config_exists(filename):

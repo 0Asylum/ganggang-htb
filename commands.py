@@ -25,8 +25,8 @@ COMMAND_HELP = [
     ("stats",        "!stats [profileID|name|@mention]", "show a member's HTB stats card (default: yourself, if claimed)", ROLE_EVERYONE),
     ("leaderboard",  "!leaderboard [points|bloods|season [number]]", "top 10; points/bloods use configured window, season number is optional", ROLE_EVERYONE),
     ("help",         "!help",                           "show this message",                           ROLE_EVERYONE),
-    ("syncqueue",    "!syncqueue",                      "show pending profile sync queue size",        ROLE_ADMIN),
-    ("syncstatus",   "!syncstatus",                     "show profile sync worker status",             ROLE_ADMIN),
+    ("syncqueue",    "!syncqueue",                      "show activity pollers and pending profile sync queue", ROLE_ADMIN),
+    ("syncstatus",   "!syncstatus",                     "show full/incremental profile sync status",   ROLE_ADMIN),
     ("dbstats",      "!dbstats",                        "show DB row counts",                          ROLE_ADMIN),
     ("setchannel",   "!setchannel <channelID|name>",    "set the channel pwn alerts are posted to (persisted to config.json)", ROLE_ADMIN),
     ("showstale",    "!showstale <duration>",           "list users with no activity in the given time (e.g. 30d, 6mo)", ROLE_ADMIN),
@@ -44,6 +44,7 @@ COMMAND_HELP = [
     ("andor",        "!andor <user1> <user2> <machine|challenge|sherlock> <ID|name> [user|root]",
                                                              "compare two users' full-history solve dates (testing)", ROLE_OWNER),
     ("trimcache",    "!trimcache",                          "remove orphaned cached avatar files",     ROLE_OWNER),
+    ("resync",       "!resync <profileID|name|@mention|all>", "queue a silent full profile-history resync", ROLE_OWNER),
     ("purgeuser",    "!purgeuser <profileID|name>",         "permanently delete a user and all their history",  ROLE_OWNER),
 ]
 
@@ -962,8 +963,8 @@ async def cmd_trimcache(message, data, api):
 
 
 async def cmd_syncqueue(message, data, api):
-    """!syncqueue -- shows what the activity poller is doing right now and
-    how many users are queued for a full profile sync.
+    """!syncqueue -- shows both activity pollers and how many users are queued
+    for a full profile sync.
     """
     activity_poller = poller.get_activity_poller()
     lines = []
@@ -973,6 +974,10 @@ async def cmd_syncqueue(message, data, api):
         # hasn't reached the point of enqueueing anything yet -- see
         # TeamActivityPoller.status().
         lines.append(f"Activity poller: {activity_poller.status()}")
+
+    profile_activity_poller = poller.get_profile_activity_poller()
+    if profile_activity_poller is not None:
+        lines.append(f"Incremental profile activity: {profile_activity_poller.status()}")
 
     worker = poller.get_sync_worker()
     if worker is None:
@@ -984,14 +989,72 @@ async def cmd_syncqueue(message, data, api):
 
 
 async def cmd_syncstatus(message, data, api):
-    """!syncstatus -- shows which user (if any) the profile sync worker is
-    currently syncing, and how many remain queued.
+    """!syncstatus -- shows full-profile worker and incremental-activity
+    reconciliation status.
     """
+    lines = []
+    worker = poller.get_sync_worker()
+    if worker is None:
+        lines.append("Full profile sync worker: not running")
+    else:
+        lines.append(f"Full profile sync: {worker.status()}")
+
+    profile_activity_poller = poller.get_profile_activity_poller()
+    if profile_activity_poller is None:
+        lines.append("Incremental profile activity: not running")
+    else:
+        lines.append(f"Incremental profile activity: {profile_activity_poller.status()}")
+
+    await message.channel.send(
+        "\n".join(lines), allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+async def cmd_resync(message, data, api):
+    """!resync <profileID|name|@mention|all> -- queues a full profile-history
+    sync even when the selected current team members were previously synced.
+    Replayed history updates stats silently and does not post pwn alerts.
+    """
+    raw = data.strip()
+    if not raw:
+        await message.channel.send(
+            "Usage: !resync <profileID|name|@mention|all>",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
     worker = poller.get_sync_worker()
     if worker is None:
         await message.channel.send("Sync worker not running.")
         return
-    await message.channel.send(worker.status())
+
+    db = database.get()
+    if raw.lower() == "all":
+        users = db.get_current_team_users()
+        queued = sum(1 for user in users if worker.enqueue(user["id"]))
+        already_queued = len(users) - queued
+        response = f"Queued full profile resync for {queued} current team member(s)."
+        if already_queued:
+            response += f" {already_queued} already queued or syncing."
+        await message.channel.send(
+            response,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    user = await _resolve_user(raw, db, message.guild)
+    if user is None:
+        await message.channel.send(
+            f"User '{raw}' not found in DB.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if worker.enqueue(user["id"]):
+        response = f"Queued full profile resync for **{user['name']}** (ID {user['id']})."
+    else:
+        response = f"**{user['name']}** (ID {user['id']}) is already queued or syncing."
+    await message.channel.send(response, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def cmd_dbstats(message, data, api):
@@ -1182,6 +1245,7 @@ COMMANDS = {
     "testpwn":      (cmd_testpwn,      ROLE_OWNER),
     "andor":        (cmd_andor,        ROLE_OWNER),
     "trimcache":    (cmd_trimcache,    ROLE_OWNER),
+    "resync":       (cmd_resync,       ROLE_OWNER),
     "purgeuser":    (cmd_purge_user,   ROLE_OWNER),
     "addadmin":     (cmd_add_admin,    ROLE_OWNER),
     "removeadmin":  (cmd_remove_admin, ROLE_OWNER),
