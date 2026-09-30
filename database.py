@@ -88,6 +88,8 @@ class Database:
                 challenge_owns INTEGER DEFAULT 0,
                 challenge_bloods INTEGER DEFAULT 0,
                 last_synced_at TEXT,
+                profile_activity_checked_at TEXT,
+                profile_activity_cursor_at TEXT,
                 is_team_member INTEGER NOT NULL DEFAULT 1
             )
             """,
@@ -257,6 +259,40 @@ class Database:
             self._connection.execute(
                 "ALTER TABLE users ADD COLUMN is_team_member INTEGER NOT NULL DEFAULT 1"
             )
+        if "profile_activity_checked_at" not in existing_user_cols:
+            self._connection.execute(
+                "ALTER TABLE users ADD COLUMN profile_activity_checked_at TEXT"
+            )
+        if "profile_activity_cursor_at" not in existing_user_cols:
+            self._connection.execute(
+                "ALTER TABLE users ADD COLUMN profile_activity_cursor_at TEXT"
+            )
+
+        # Seed the durable rotation from existing full-sync data. This avoids
+        # replaying every historical activity page immediately after upgrading,
+        # while still leaving never-synced users for ProfileSyncWorker.
+        self._connection.execute("""
+            UPDATE users
+            SET profile_activity_checked_at = last_synced_at
+            WHERE profile_activity_checked_at IS NULL
+              AND last_synced_at IS NOT NULL
+        """)
+        self._connection.execute("""
+            UPDATE users
+            SET profile_activity_cursor_at = (
+                SELECT MAX(activity.own_date)
+                FROM (
+                    SELECT user_id, own_date FROM user_machine_solves
+                    UNION ALL
+                    SELECT user_id, own_date FROM user_challenge_solves
+                    UNION ALL
+                    SELECT user_id, own_date FROM user_sherlock_solves
+                ) AS activity
+                WHERE activity.user_id = users.id
+            )
+            WHERE profile_activity_cursor_at IS NULL
+              AND last_synced_at IS NOT NULL
+        """)
 
         # Hard DB-level guarantee that an HTB profile can only ever be linked to one
         # Discord account -- a partial index (ignoring NULLs) so unclaimed rows don't
@@ -424,12 +460,51 @@ class Database:
 
         return {"added": added, "renamed": renamed, "removed": removed}
 
-    def mark_user_synced(self, user_id, timestamp):
-        """Records when a user's full profile sync last completed."""
+    def mark_user_synced(self, user_id, timestamp, activity_cursor=None):
+        """Records a completed full profile sync.
+
+        A full sync also constitutes a successful incremental-activity check,
+        so both rotation timestamps are advanced together. ``activity_cursor``
+        is the newest activity timestamp returned by HTB, or None for a profile
+        with no activity.
+        """
         self._connection.execute(
-            "UPDATE users SET last_synced_at = ? WHERE id = ?",
-            (timestamp, user_id),
+            """
+            UPDATE users
+            SET last_synced_at = ?,
+                profile_activity_checked_at = ?,
+                profile_activity_cursor_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, activity_cursor, user_id),
         )
+        self._connection.commit()
+
+    def get_next_profile_activity_user(self):
+        """Returns the current, fully-synced member whose incremental profile
+        activity check is oldest. NULL check times sort first, making the
+        rotation persistent and restart-safe without an in-memory index.
+        """
+        return self._connection.execute("""
+            SELECT * FROM users
+            WHERE is_team_member = 1 AND last_synced_at IS NOT NULL
+            ORDER BY
+                profile_activity_checked_at IS NOT NULL,
+                profile_activity_checked_at ASC,
+                id ASC
+            LIMIT 1
+        """).fetchone()
+
+    def mark_profile_activity_checked(self, user_id, timestamp, activity_cursor):
+        """Advances one member's incremental-activity rotation state after a
+        successful check. The caller deliberately invokes this only after all
+        required pages have been processed, so an interrupted check is retried.
+        """
+        self._connection.execute("""
+            UPDATE users
+            SET profile_activity_checked_at = ?, profile_activity_cursor_at = ?
+            WHERE id = ? AND is_team_member = 1
+        """, (timestamp, activity_cursor, user_id))
         self._connection.commit()
 
     def get_user(self, user_id):
@@ -445,6 +520,13 @@ class Database:
             "SELECT * FROM users WHERE name = ? COLLATE NOCASE", (name,)
         )
         return cursor.fetchone()
+
+    def get_current_team_users(self):
+        """Returns all current team members, ordered by HTB username."""
+        cursor = self._connection.execute(
+            "SELECT * FROM users WHERE is_team_member = 1 ORDER BY name COLLATE NOCASE"
+        )
+        return cursor.fetchall()
 
     # ── seasons ────────────────────────────────────────────────────────────────
 
@@ -612,101 +694,88 @@ class Database:
 
     def upsert_machine_solve(self, user_id, machine_id, solve_type, own_date,
                              blood=False, points=0):
-        """Records a user's user/root solve on a machine, and works out
-        whether they hold team blood for it: the earliest solver by own_date
-        keeps it, so an out-of-order sync (e.g. discovering an older solve
-        after a newer one was already recorded) correctly reassigns it.
+        """Records a user's user/root solve and assigns team blood to the
+        earliest stored solve. Recomputing after the upsert keeps resyncs and
+        out-of-order history imports idempotent.
         """
-        holder = self._connection.execute("""
-            SELECT user_id, own_date FROM user_machine_solves
-            WHERE machine_id = ? AND solve_type = ? AND team_blood = 1
-        """, (machine_id, solve_type)).fetchone()
-
-        if holder is None:
-            team_blood = 1
-        elif own_date < holder["own_date"]:
-            self._connection.execute("""
-                UPDATE user_machine_solves SET team_blood = 0
-                WHERE machine_id = ? AND solve_type = ? AND team_blood = 1
-            """, (machine_id, solve_type))
-            team_blood = 1
-        else:
-            team_blood = 0
-
         self._connection.execute("""
             INSERT INTO user_machine_solves
                 (user_id, machine_id, solve_type, own_date, blood, points, team_blood)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(user_id, machine_id, solve_type) DO UPDATE SET
                 own_date=excluded.own_date,
                 blood=excluded.blood,
-                points=excluded.points,
-                team_blood=excluded.team_blood
-        """, (user_id, machine_id, solve_type, own_date, 1 if blood else 0, points, team_blood))
+                points=excluded.points
+        """, (user_id, machine_id, solve_type, own_date, 1 if blood else 0, points))
+        self._connection.execute("""
+            UPDATE user_machine_solves SET team_blood = 0
+            WHERE machine_id = ? AND solve_type = ?
+        """, (machine_id, solve_type))
+        winner = self._connection.execute("""
+            SELECT user_id FROM user_machine_solves
+            WHERE machine_id = ? AND solve_type = ?
+            ORDER BY own_date ASC, user_id ASC LIMIT 1
+        """, (machine_id, solve_type)).fetchone()
+        self._connection.execute("""
+            UPDATE user_machine_solves SET team_blood = 1
+            WHERE user_id = ? AND machine_id = ? AND solve_type = ?
+        """, (winner["user_id"], machine_id, solve_type))
 
     def upsert_challenge_solve(self, user_id, challenge_id, own_date,
                                blood=False, points=0):
-        """Records a user's challenge solve and works out team blood, same
-        earliest-by-own_date rule as upsert_machine_solve.
+        """Records a user's challenge solve and assigns team blood to the
+        earliest stored own_date, same as upsert_machine_solve.
         """
-        holder = self._connection.execute("""
-            SELECT user_id, own_date FROM user_challenge_solves
-            WHERE challenge_id = ? AND team_blood = 1
-        """, (challenge_id,)).fetchone()
-
-        if holder is None:
-            team_blood = 1
-        elif own_date < holder["own_date"]:
-            self._connection.execute("""
-                UPDATE user_challenge_solves SET team_blood = 0
-                WHERE challenge_id = ? AND team_blood = 1
-            """, (challenge_id,))
-            team_blood = 1
-        else:
-            team_blood = 0
-
         self._connection.execute("""
             INSERT INTO user_challenge_solves
                 (user_id, challenge_id, own_date, blood, points, team_blood)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 0)
             ON CONFLICT(user_id, challenge_id) DO UPDATE SET
                 own_date=excluded.own_date,
                 blood=excluded.blood,
-                points=excluded.points,
-                team_blood=excluded.team_blood
-        """, (user_id, challenge_id, own_date, 1 if blood else 0, points, team_blood))
+                points=excluded.points
+        """, (user_id, challenge_id, own_date, 1 if blood else 0, points))
+        self._connection.execute(
+            "UPDATE user_challenge_solves SET team_blood = 0 WHERE challenge_id = ?",
+            (challenge_id,),
+        )
+        winner = self._connection.execute("""
+            SELECT user_id FROM user_challenge_solves
+            WHERE challenge_id = ?
+            ORDER BY own_date ASC, user_id ASC LIMIT 1
+        """, (challenge_id,)).fetchone()
+        self._connection.execute("""
+            UPDATE user_challenge_solves SET team_blood = 1
+            WHERE user_id = ? AND challenge_id = ?
+        """, (winner["user_id"], challenge_id))
 
     def upsert_sherlock_solve(self, user_id, sherlock_id, own_date,
                               blood=False, points=0):
-        """Records a user's sherlock solve and works out team blood, same
-        earliest-by-own_date rule as upsert_machine_solve.
+        """Records a user's sherlock solve and assigns team blood to the
+        earliest stored own_date, same as upsert_machine_solve.
         """
-        holder = self._connection.execute("""
-            SELECT user_id, own_date FROM user_sherlock_solves
-            WHERE sherlock_id = ? AND team_blood = 1
-        """, (sherlock_id,)).fetchone()
-
-        if holder is None:
-            team_blood = 1
-        elif own_date < holder["own_date"]:
-            self._connection.execute("""
-                UPDATE user_sherlock_solves SET team_blood = 0
-                WHERE sherlock_id = ? AND team_blood = 1
-            """, (sherlock_id,))
-            team_blood = 1
-        else:
-            team_blood = 0
-
         self._connection.execute("""
             INSERT INTO user_sherlock_solves
                 (user_id, sherlock_id, own_date, blood, points, team_blood)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 0)
             ON CONFLICT(user_id, sherlock_id) DO UPDATE SET
                 own_date=excluded.own_date,
                 blood=excluded.blood,
-                points=excluded.points,
-                team_blood=excluded.team_blood
-        """, (user_id, sherlock_id, own_date, 1 if blood else 0, points, team_blood))
+                points=excluded.points
+        """, (user_id, sherlock_id, own_date, 1 if blood else 0, points))
+        self._connection.execute(
+            "UPDATE user_sherlock_solves SET team_blood = 0 WHERE sherlock_id = ?",
+            (sherlock_id,),
+        )
+        winner = self._connection.execute("""
+            SELECT user_id FROM user_sherlock_solves
+            WHERE sherlock_id = ?
+            ORDER BY own_date ASC, user_id ASC LIMIT 1
+        """, (sherlock_id,)).fetchone()
+        self._connection.execute("""
+            UPDATE user_sherlock_solves SET team_blood = 1
+            WHERE user_id = ? AND sherlock_id = ?
+        """, (winner["user_id"], sherlock_id))
 
     def upsert_prolab_progress(self, user_id, prolab_id, owned_flags,
                                completion_percentage):

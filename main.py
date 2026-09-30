@@ -164,8 +164,11 @@ def main():
     poller.set_sync_worker(sync_worker)
     activity_poller = poller.TeamActivityPoller()
     poller.set_activity_poller(activity_poller)
+    profile_activity_poller = poller.ProfileActivityPoller()
+    poller.set_profile_activity_poller(profile_activity_poller)
     POLLERS.extend([
         activity_poller,
+        profile_activity_poller,
         poller.EasterEggPoller(),
         sync_worker,
     ])

@@ -62,7 +62,7 @@ cards (`!preference`) and set a short tag (`!tag`).
 | `!claim <profileID\|name>` | request to link your Discord account to one HTB profile | everyone |
 | `!preference <htb\|discord>` | choose which avatar shows for you | everyone |
 | `!tag <text>` | set a short tag shown on your `!stats` card | everyone |
-| `!syncqueue` / `!syncstatus` | show poller/profile-sync worker status | admin |
+| `!syncqueue` / `!syncstatus` | show team, incremental-activity, and full-profile sync status | admin |
 | `!dbstats` | show DB row counts | admin |
 | `!setchannel <channelID\|name>` | set the channel pwn alerts are posted to | admin |
 | `!showstale <duration>` | list users with no activity in the given time | admin |
@@ -71,8 +71,28 @@ cards (`!preference`) and set a short tag (`!tag`).
 | `!addadmin` / `!removeadmin <@mention\|discordID>` | grant/revoke admin role | owner |
 | `!showadmins` | list current admins | owner |
 | `!trimcache` | remove orphaned cached avatar files | owner |
+| `!resync <profileID\|name\|@mention\|all>` | queue a silent full-history resync for one or all current members | owner |
 | `!purgeuser <profileID\|name>` | permanently delete a user and all their history | owner |
 | `!testpwn` / `!andor` | testing utilities for the render pipeline / team-blood logic | owner |
+
+Full profile histories are synced when a roster member is first seen. Because
+HTB's team activity feed omits Sherlock solves, the bot also runs a durable,
+staggered reconciliation of one member's v5 profile activity every
+`profile_activity_poll_interval` seconds (10 minutes by default). With 24
+members, each profile is therefore checked about every four hours. It normally
+fetches one activity page and requests older pages only until it reaches that
+member's stored cursor. These checks update stats silently and never generate
+pwn-alert posts.
+
+The rotation stores both its last-check time and newest processed activity time
+in SQLite. If the bot stops during a check, that member remains the oldest and
+is retried after restart; solve upserts make the replay safe. Use `!resync`
+after deploying an ingestion fix or when stored lifetime stats need a complete
+backfill.
+
+After upgrading from a version that skipped `type: "sherlock"` profile
+activity, run `!resync all` once and monitor progress with `!syncstatus` or
+`!syncqueue`. This backfills Sherlock solves for every current team member.
 
 ## Running it
 
