@@ -1,6 +1,7 @@
 import asyncio
 import os
 import argparse
+from datetime import timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import logging
@@ -82,8 +83,8 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    """Dispatches a "!command" message to its handler, after checking the
-    guild restriction, per-user cooldown, and role requirement.
+    """Records human guild-message activity, then dispatches a "!command"
+    after checking the guild restriction, per-user cooldown, and role requirement.
     """
     if message.author == client.user:
         return
@@ -91,6 +92,14 @@ async def on_message(message):
     cfg = config.get()
     if cfg.guild_id and (message.guild is None or message.guild.id != cfg.guild_id):
         return
+
+    if message.guild is not None and not message.author.bot:
+        timestamp = (
+            message.created_at.astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        database.get().record_discord_activity(message.author.id, timestamp)
 
     if not message.content.startswith("!"):
         return
