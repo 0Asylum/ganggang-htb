@@ -13,14 +13,17 @@ contribution workflow.
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
    and create a new application, then add a Bot user to it.
-2. Under the bot's settings, enable the **Message Content Intent** (under
-   Privileged Gateway Intents) -- the bot reads `!command` text out of message
-   content, and won't receive it without this enabled.
+2. Under the bot's settings, enable **Message Content Intent** and **Server
+   Members Intent** (under Privileged Gateway Intents). Message Content is needed
+   for `!command` text; Server Members lets `!showstale ... discord` include
+   members who have never posted.
 3. Copy the bot's token. You'll need it for `.env` in step 4.
 4. Under OAuth2 > URL Generator, select the `bot` scope and at least
-   `Send Messages` + `Attach Files` permissions, then use the generated URL to
-   invite your bot to a **private test server** of your own (create one if you
-   don't have one -- it costs nothing and takes a minute).
+   `View Channels`, `Read Message History`, `Send Messages`, and `Attach Files`
+   permissions, then use the generated URL to invite your bot to a **private test
+   server** of your own (create one if you don't have one -- it costs nothing and
+   takes a minute). The first `!showstale ... discord` run fully backfills
+   accessible channel history and can therefore take longer than later runs.
 
 ### HTB API token and team
 

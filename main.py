@@ -16,6 +16,7 @@ import poller
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 
 logger = logging.getLogger(__name__)

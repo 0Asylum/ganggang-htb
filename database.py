@@ -220,6 +220,14 @@ class Database:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS discord_history_channels (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                backfilled_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS claims (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 discord_id INTEGER NOT NULL,
@@ -977,49 +985,21 @@ class Database:
         """, (*machine_ids, limit))
         return cursor.fetchall()
 
-    def get_stale_users(self, cutoff, mode="combined"):
-        """Current members stale in the requested activity source.
+    def get_stale_htb_users(self, cutoff):
+        """Current HTB members with no team activity on or after ``cutoff``.
 
-        ``combined`` requires both HTB and Discord to be stale. ``htb`` and
-        ``discord`` consider only that source. An unlinked Discord account has
-        no attributable Discord activity and is therefore stale in that source.
+        Results put members with no recorded team-feed activity first, followed
+        by members with the oldest activity.
         """
-        filters = {
-            "combined": """
-                (last_active IS NULL OR last_active < ?)
-                AND (discord_last_active IS NULL OR discord_last_active < ?)
-            """,
-            "htb": "last_active IS NULL OR last_active < ?",
-            "discord": "discord_last_active IS NULL OR discord_last_active < ?",
-        }
-        order_by = {
-            "combined": """
-                (last_active IS NULL AND discord_last_active IS NULL) DESC,
-                CASE
-                    WHEN last_active IS NULL THEN discord_last_active
-                    WHEN discord_last_active IS NULL THEN last_active
-                    WHEN last_active >= discord_last_active THEN last_active
-                    ELSE discord_last_active
-                END ASC
-            """,
-            "htb": "(last_active IS NULL) DESC, last_active ASC",
-            "discord": "(discord_last_active IS NULL) DESC, discord_last_active ASC",
-        }
-        if mode not in filters:
-            raise ValueError(f"Unknown stale activity mode: {mode}")
-
-        params = (cutoff, cutoff) if mode == "combined" else (cutoff,)
-        cursor = self._connection.execute(f"""
-            SELECT u.id, u.name, MAX(t.date) AS last_active,
-                   du.discord_id, du.last_active_at AS discord_last_active
+        cursor = self._connection.execute("""
+            SELECT u.id, u.name, MAX(t.date) AS last_active
             FROM users u
             LEFT JOIN team_activity t ON t.user_id = u.id
-            LEFT JOIN discord_users du ON du.htb_user_id = u.id
             WHERE u.is_team_member = 1
-            GROUP BY u.id, u.name, du.discord_id, du.last_active_at
-            HAVING {filters[mode]}
-            ORDER BY {order_by[mode]}
-        """, params)
+            GROUP BY u.id, u.name
+            HAVING last_active IS NULL OR last_active < ?
+            ORDER BY (last_active IS NULL) DESC, last_active ASC
+        """, (cutoff,))
         return cursor.fetchall()
 
     def get_machine(self, machine_id):
@@ -1130,6 +1110,66 @@ class Database:
                     ELSE discord_users.last_active_at
                 END
         """, (discord_id, timestamp))
+        self._connection.commit()
+
+    def record_discord_activity_batch(self, activity):
+        """Records newest observed message times for multiple Discord users."""
+        self._connection.executemany("""
+            INSERT INTO discord_users (discord_id, last_active_at)
+            VALUES (?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                last_active_at = CASE
+                    WHEN discord_users.last_active_at IS NULL
+                      OR excluded.last_active_at > discord_users.last_active_at
+                    THEN excluded.last_active_at
+                    ELSE discord_users.last_active_at
+                END
+        """, activity.items())
+        self._connection.commit()
+
+    def get_discord_activity(self, discord_ids):
+        """Returns ``discord_id -> last_active_at`` for the requested accounts.
+
+        Missing IDs have never produced a stored guild message and are omitted.
+        Queries are chunked below SQLite's usual bound-parameter limit.
+        """
+        discord_ids = list(dict.fromkeys(discord_ids))
+        activity = {}
+        for start in range(0, len(discord_ids), 900):
+            chunk = discord_ids[start:start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._connection.execute(f"""
+                SELECT discord_id, last_active_at
+                FROM discord_users
+                WHERE discord_id IN ({placeholders})
+            """, chunk).fetchall()
+            activity.update({row["discord_id"]: row["last_active_at"] for row in rows})
+        return activity
+
+    def get_backfilled_discord_channels(self, guild_id, channel_ids):
+        """Channel IDs whose accessible history has been completely scanned."""
+        channel_ids = list(dict.fromkeys(channel_ids))
+        completed = set()
+        for start in range(0, len(channel_ids), 900):
+            chunk = channel_ids[start:start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._connection.execute(f"""
+                SELECT channel_id
+                FROM discord_history_channels
+                WHERE guild_id = ? AND channel_id IN ({placeholders})
+            """, (guild_id, *chunk)).fetchall()
+            completed.update(row["channel_id"] for row in rows)
+        return completed
+
+    def mark_discord_channels_backfilled(self, guild_id, channel_ids, timestamp):
+        """Records successful full-history scans for Discord channels."""
+        self._connection.executemany("""
+            INSERT INTO discord_history_channels
+                (guild_id, channel_id, backfilled_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                backfilled_at = excluded.backfilled_at
+        """, ((guild_id, channel_id, timestamp) for channel_id in channel_ids))
         self._connection.commit()
 
     def set_discord_role(self, discord_id, role):
@@ -1372,7 +1412,7 @@ class Database:
     def get_table_counts(self):
         """Row count for every tracked table, for !dbstats."""
         tables = [
-            "team_activity", "users", "discord_users", "claims",
+            "team_activity", "users", "discord_users", "discord_history_channels", "claims",
             "machines", "challenges", "sherlocks", "prolabs", "fortresses",
             "seasons", "season_machines",
             "user_machine_solves", "user_challenge_solves", "user_sherlock_solves",

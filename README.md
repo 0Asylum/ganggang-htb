@@ -65,7 +65,7 @@ cards (`!preference`) and set a short tag (`!tag`).
 | `!syncqueue` / `!syncstatus` | show team, incremental-activity, and full-profile sync status | admin |
 | `!dbstats` | show DB row counts | admin |
 | `!setchannel <channelID\|name>` | set the channel pwn alerts are posted to | admin |
-| `!showstale <duration> [combined\|htb\|discord]` | list users stale across both HTB and Discord (default), or only one source | admin |
+| `!showstale <duration> [htb\|discord]` | list inactive HTB members (default) or inactive Discord members | admin |
 | `!claimqueue` | list pending claim requests | admin |
 | `!approve <claimID>` / `!deny <claimID> [reason]` | resolve a pending claim | admin |
 | `!addadmin` / `!removeadmin <@mention\|discordID>` | grant/revoke admin role | owner |
@@ -90,14 +90,18 @@ is retried after restart; solve upserts make the replay safe. Use `!resync`
 after deploying an ingestion fix or when stored lifetime stats need a complete
 backfill.
 
-`!showstale` tracks two different kinds of activity for current team members:
-HTB solve entries observed in the team activity feed and human messages observed
-in the configured Discord guild. `!showstale 30d` uses combined mode, so a member
-is stale only if neither source has activity in the last 30 days. Use
-`!showstale 30d htb` or `!showstale 30d discord` to check one source. Discord
-activity is associated through an approved `!claim`; an unlinked member counts
-as having no Discord activity. Discord timestamps begin being collected after
-this version is deployed and cannot be backfilled from older server messages.
+`!showstale` has two independent views. `!showstale 30d` and
+`!showstale 30d htb` list current HTB members without a team-feed solve in the
+last 30 days. `!showstale 30d discord` lists current human members of the
+configured Discord guild who have not posted in any guild channel during that
+window. Discord mode does not use HTB claims or account links. The bot stores
+only each Discord account's newest observed message timestamp, never message
+content. The first check fully backfills accessible text-channel and active-thread
+history so stale entries can show activity older than the requested duration.
+Completed channels are remembered in SQLite; later checks reconcile only the
+requested recent window and continue tracking new posts live. Channels where the
+bot lacks View Channel or Read Message History permission are skipped and
+reported in the command output.
 
 After upgrading from a version that skipped `type: "sherlock"` profile
 activity, run `!resync all` once and monitor progress with `!syncstatus` or
