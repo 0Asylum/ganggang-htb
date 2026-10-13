@@ -29,7 +29,7 @@ COMMAND_HELP = [
     ("syncstatus",   "!syncstatus",                     "show full/incremental profile sync status",   ROLE_ADMIN),
     ("dbstats",      "!dbstats",                        "show DB row counts",                          ROLE_ADMIN),
     ("setchannel",   "!setchannel <channelID|name>",    "set the channel pwn alerts are posted to (persisted to config.json)", ROLE_ADMIN),
-    ("showstale",    "!showstale <duration>",           "list users with no activity in the given time (e.g. 30d, 6mo)", ROLE_ADMIN),
+    ("showstale",    "!showstale <duration> [combined|htb|discord]", "list users stale across both sources (default) or one source", ROLE_ADMIN),
     ("claim",        "!claim <profileID|name>",         "request to link your Discord account to one HTB profile (1:1, permanent until an admin changes it)", ROLE_EVERYONE),
     ("preference",   "!preference <htb|discord>",       "choose which avatar shows for you (requires an approved claim)", ROLE_EVERYONE),
     ("tag",          "!tag <text>",                     f"set a short tag shown on your !stats card (requires an approved claim, max {image_gen.MAX_TAG_LENGTH} chars)", ROLE_EVERYONE),
@@ -406,6 +406,27 @@ HELP_INDENT      = "  "
 
 DISCORD_MESSAGE_LIMIT = 2000
 _CODE_BLOCK_OVERHEAD  = len("```\n\n```")  # the ``` wrapper itself counts against the limit
+
+
+async def _send_text_lines(channel, lines):
+    """Sends lines in chunks that fit Discord's message-size limit."""
+    chunks = []
+    current = []
+    current_len = 0
+    for line in lines:
+        added_len = len(line) + (1 if current else 0)
+        if current and current_len + added_len > DISCORD_MESSAGE_LIMIT:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+            added_len = len(line)
+        current.append(line)
+        current_len += added_len
+    if current:
+        chunks.append("\n".join(current))
+
+    for chunk in chunks:
+        await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def _send_code_block(channel, body):
@@ -1145,6 +1166,7 @@ _DURATION_UNITS = {
     "y":  31536000,  # 365 days, approximate
 }
 _DURATION_RE = re.compile(r"(\d+)(mo|[smhdwy])")
+_STALE_MODES = {"combined", "htb", "discord"}
 
 
 def _parse_duration(raw):
@@ -1178,49 +1200,94 @@ def _format_age(delta):
     return f"{days // 365}y"
 
 
+def _parse_stale_args(raw):
+    """Returns (duration_text, mode, timedelta), or None for invalid input.
+
+    Duration-first is the documented form, but mode-first is accepted too.
+    """
+    parts = raw.strip().lower().split()
+    mode = "combined"
+    duration_raw = None
+    if len(parts) == 1:
+        duration_raw = parts[0]
+    elif len(parts) == 2:
+        if parts[0] in _STALE_MODES:
+            mode, duration_raw = parts
+        elif parts[1] in _STALE_MODES:
+            duration_raw, mode = parts
+
+    delta = _parse_duration(duration_raw) if duration_raw is not None else None
+    if delta is None:
+        return None
+    return duration_raw, mode, delta
+
+
+def _activity_age(value, now):
+    """Formats an ISO timestamp as a compact age for !showstale output."""
+    if value is None:
+        return "none recorded"
+    last = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return f"{_format_age(now - last)} ago"
+
+
 async def cmd_show_stale(message, data, api):
-    """!showstale <duration> -- lists users with no recorded activity since
-    the given duration ago (e.g. 30d, 6mo).
+    """!showstale <duration> [combined|htb|discord] -- lists current team
+    members with no recorded activity in the selected source(s).
     """
     raw = data.strip()
     if not raw:
         await message.channel.send(
-            "Usage: !showstale <duration> (e.g. 45s, 20m, 6h, 30d, 2w, 3mo, 1y)",
+            "Usage: !showstale <duration> [combined|htb|discord] "
+            "(e.g. !showstale 30d, !showstale 30d htb)",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
 
-    delta = _parse_duration(raw)
-    if delta is None:
+    parsed = _parse_stale_args(raw)
+    if parsed is None:
         await message.channel.send(
-            "Couldn't parse duration. Use a number + unit: s|m|h|d|w|mo|y (e.g. 30d, 20m, 6mo).",
+            "Usage: !showstale <duration> [combined|htb|discord]. "
+            "Duration uses s|m|h|d|w|mo|y (e.g. 30d or 6mo).",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
+    duration_raw, mode, delta = parsed
 
     now = datetime.now(timezone.utc)
     cutoff = (now - delta).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    rows = database.get().get_stale_users(cutoff)
+    rows = database.get().get_stale_users(cutoff, mode)
+    source_labels = {
+        "combined": "HTB or Discord",
+        "htb": "HTB",
+        "discord": "Discord",
+    }
+    source_label = source_labels[mode]
     if not rows:
         await message.channel.send(
-            f"No stale users -- everyone has activity within the last {raw}.",
+            f"No stale users -- everyone has {source_label} activity within "
+            f"the last {duration_raw}.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
 
-    lines = [f"**Stale users (no activity in the last {raw}):**"]
+    lines = [f"**Stale users (no {source_label} activity in the last {duration_raw}):**"]
     for row in rows:
-        if row["last_active"] is None:
-            lines.append(f"  `{row['name']}` -- no recorded activity")
+        htb_status = _activity_age(row["last_active"], now)
+        if row["discord_id"] is None:
+            discord_status = "not linked"
         else:
-            last = datetime.fromisoformat(row["last_active"].replace("Z", "+00:00"))
-            lines.append(f"  `{row['name']}` -- last active {_format_age(now - last)} ago")
+            discord_status = _activity_age(row["discord_last_active"], now)
 
-    await message.channel.send(
-        "\n".join(lines),
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+        if mode == "combined":
+            detail = f"HTB: {htb_status}; Discord: {discord_status}"
+        elif mode == "htb":
+            detail = f"HTB: {htb_status}"
+        else:
+            detail = f"Discord: {discord_status}"
+        lines.append(f"  `{row['name']}` -- {detail}")
+
+    await _send_text_lines(message.channel, lines)
 
 
 COMMANDS = {

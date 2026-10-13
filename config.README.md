@@ -14,7 +14,9 @@ Restart the bot after editing any of these — nothing is hot-reloaded.
 - **`team_id`** (int) — HTB team ID this bot tracks. GANGGANG is `8709`.
 - **`channel_id`** (int) — Discord channel ID pwn/blood announcements get posted to.
 - **`guild_id`** (int) — Discord server ID the bot is scoped to. If a message comes
-  from any other guild (or a DM), `on_message` ignores it.
+  from any other guild (or a DM), `on_message` ignores it. Human messages in this
+  guild update the sender's persisted Discord activity timestamp for
+  `!showstale`; message content is not stored.
 - **`htb_base_url`** (str) — HTB API base URL. `https://labs.hackthebox.com`. No
   reason to change this unless HTB restructures their API domain.
 - **`user_agent`** (str) — sent on every HTB API request. Just needs to look like a

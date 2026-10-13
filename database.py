@@ -215,7 +215,8 @@ class Database:
                 role INTEGER NOT NULL DEFAULT 0,
                 htb_user_id INTEGER REFERENCES users(id),
                 avatar_pref TEXT NOT NULL DEFAULT 'htb',
-                tag TEXT
+                tag TEXT,
+                last_active_at TEXT
             )
             """,
             """
@@ -248,6 +249,10 @@ class Database:
             )
         if "tag" not in existing_cols:
             self._connection.execute("ALTER TABLE discord_users ADD COLUMN tag TEXT")
+        if "last_active_at" not in existing_cols:
+            self._connection.execute(
+                "ALTER TABLE discord_users ADD COLUMN last_active_at TEXT"
+            )
 
         existing_user_cols = {
             row["name"] for row in self._connection.execute("PRAGMA table_info(users)")
@@ -972,19 +977,49 @@ class Database:
         """, (*machine_ids, limit))
         return cursor.fetchall()
 
-    def get_stale_users(self, cutoff):
-        """Users with no team_activity on or after `cutoff` (or none at all),
-        ordered with never-active users first, then oldest-active next.
+    def get_stale_users(self, cutoff, mode="combined"):
+        """Current members stale in the requested activity source.
+
+        ``combined`` requires both HTB and Discord to be stale. ``htb`` and
+        ``discord`` consider only that source. An unlinked Discord account has
+        no attributable Discord activity and is therefore stale in that source.
         """
-        cursor = self._connection.execute("""
-            SELECT u.id, u.name, MAX(t.date) AS last_active
+        filters = {
+            "combined": """
+                (last_active IS NULL OR last_active < ?)
+                AND (discord_last_active IS NULL OR discord_last_active < ?)
+            """,
+            "htb": "last_active IS NULL OR last_active < ?",
+            "discord": "discord_last_active IS NULL OR discord_last_active < ?",
+        }
+        order_by = {
+            "combined": """
+                (last_active IS NULL AND discord_last_active IS NULL) DESC,
+                CASE
+                    WHEN last_active IS NULL THEN discord_last_active
+                    WHEN discord_last_active IS NULL THEN last_active
+                    WHEN last_active >= discord_last_active THEN last_active
+                    ELSE discord_last_active
+                END ASC
+            """,
+            "htb": "(last_active IS NULL) DESC, last_active ASC",
+            "discord": "(discord_last_active IS NULL) DESC, discord_last_active ASC",
+        }
+        if mode not in filters:
+            raise ValueError(f"Unknown stale activity mode: {mode}")
+
+        params = (cutoff, cutoff) if mode == "combined" else (cutoff,)
+        cursor = self._connection.execute(f"""
+            SELECT u.id, u.name, MAX(t.date) AS last_active,
+                   du.discord_id, du.last_active_at AS discord_last_active
             FROM users u
             LEFT JOIN team_activity t ON t.user_id = u.id
+            LEFT JOIN discord_users du ON du.htb_user_id = u.id
             WHERE u.is_team_member = 1
-            GROUP BY u.id, u.name
-            HAVING last_active IS NULL OR last_active < ?
-            ORDER BY (last_active IS NULL) DESC, last_active ASC
-        """, (cutoff,))
+            GROUP BY u.id, u.name, du.discord_id, du.last_active_at
+            HAVING {filters[mode]}
+            ORDER BY {order_by[mode]}
+        """, params)
         return cursor.fetchall()
 
     def get_machine(self, machine_id):
@@ -1060,7 +1095,7 @@ class Database:
 
     def get_discord_user(self, discord_id):
         """Fetches a discord_users row by Discord ID, or None if this account
-        has no row yet (never claimed, never had a role set).
+        has no row yet (never observed, claimed, or assigned a role).
         """
         cursor = self._connection.execute(
             "SELECT * FROM discord_users WHERE discord_id = ?", (discord_id,)
@@ -1076,6 +1111,26 @@ class Database:
         )
         row = cursor.fetchone()
         return row["role"] if row else 0
+
+    def record_discord_activity(self, discord_id, timestamp):
+        """Records the newest observed guild-message time for a Discord user.
+
+        The row may predate an HTB claim; linking later preserves this activity.
+        The comparison prevents an out-of-order event from moving the timestamp
+        backwards.
+        """
+        self._connection.execute("""
+            INSERT INTO discord_users (discord_id, last_active_at)
+            VALUES (?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                last_active_at = CASE
+                    WHEN discord_users.last_active_at IS NULL
+                      OR excluded.last_active_at > discord_users.last_active_at
+                    THEN excluded.last_active_at
+                    ELSE discord_users.last_active_at
+                END
+        """, (discord_id, timestamp))
+        self._connection.commit()
 
     def set_discord_role(self, discord_id, role):
         """Sets a Discord account's permission role (creating its

@@ -65,7 +65,7 @@ cards (`!preference`) and set a short tag (`!tag`).
 | `!syncqueue` / `!syncstatus` | show team, incremental-activity, and full-profile sync status | admin |
 | `!dbstats` | show DB row counts | admin |
 | `!setchannel <channelID\|name>` | set the channel pwn alerts are posted to | admin |
-| `!showstale <duration>` | list users with no activity in the given time | admin |
+| `!showstale <duration> [combined\|htb\|discord]` | list users stale across both HTB and Discord (default), or only one source | admin |
 | `!claimqueue` | list pending claim requests | admin |
 | `!approve <claimID>` / `!deny <claimID> [reason]` | resolve a pending claim | admin |
 | `!addadmin` / `!removeadmin <@mention\|discordID>` | grant/revoke admin role | owner |
@@ -89,6 +89,15 @@ in SQLite. If the bot stops during a check, that member remains the oldest and
 is retried after restart; solve upserts make the replay safe. Use `!resync`
 after deploying an ingestion fix or when stored lifetime stats need a complete
 backfill.
+
+`!showstale` tracks two different kinds of activity for current team members:
+HTB solve entries observed in the team activity feed and human messages observed
+in the configured Discord guild. `!showstale 30d` uses combined mode, so a member
+is stale only if neither source has activity in the last 30 days. Use
+`!showstale 30d htb` or `!showstale 30d discord` to check one source. Discord
+activity is associated through an approved `!claim`; an unlinked member counts
+as having no Discord activity. Discord timestamps begin being collected after
+this version is deployed and cannot be backfilled from older server messages.
 
 After upgrading from a version that skipped `type: "sherlock"` profile
 activity, run `!resync all` once and monitor progress with `!syncstatus` or
