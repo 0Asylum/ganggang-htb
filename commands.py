@@ -2,6 +2,7 @@ import re
 import os
 import fnmatch
 import logging
+import asyncio
 from datetime import datetime, timedelta, timezone
 import discord
 import config
@@ -29,7 +30,7 @@ COMMAND_HELP = [
     ("syncstatus",   "!syncstatus",                     "show full/incremental profile sync status",   ROLE_ADMIN),
     ("dbstats",      "!dbstats",                        "show DB row counts",                          ROLE_ADMIN),
     ("setchannel",   "!setchannel <channelID|name>",    "set the channel pwn alerts are posted to (persisted to config.json)", ROLE_ADMIN),
-    ("showstale",    "!showstale <duration> [combined|htb|discord]", "list users stale across both sources (default) or one source", ROLE_ADMIN),
+    ("showstale",    "!showstale <duration> [htb|discord]", "list inactive HTB members (default) or inactive Discord members", ROLE_ADMIN),
     ("claim",        "!claim <profileID|name>",         "request to link your Discord account to one HTB profile (1:1, permanent until an admin changes it)", ROLE_EVERYONE),
     ("preference",   "!preference <htb|discord>",       "choose which avatar shows for you (requires an approved claim)", ROLE_EVERYONE),
     ("tag",          "!tag <text>",                     f"set a short tag shown on your !stats card (requires an approved claim, max {image_gen.MAX_TAG_LENGTH} chars)", ROLE_EVERYONE),
@@ -1166,7 +1167,9 @@ _DURATION_UNITS = {
     "y":  31536000,  # 365 days, approximate
 }
 _DURATION_RE = re.compile(r"(\d+)(mo|[smhdwy])")
-_STALE_MODES = {"combined", "htb", "discord"}
+_STALE_MODES = {"htb", "discord"}
+_DISCORD_HISTORY_LOCKS = {}
+_DISCORD_HISTORY_COVERAGE = {}
 
 
 def _parse_duration(raw):
@@ -1206,7 +1209,7 @@ def _parse_stale_args(raw):
     Duration-first is the documented form, but mode-first is accepted too.
     """
     parts = raw.strip().lower().split()
-    mode = "combined"
+    mode = "htb"
     duration_raw = None
     if len(parts) == 1:
         duration_raw = parts[0]
@@ -1230,15 +1233,131 @@ def _activity_age(value, now):
     return f"{_format_age(now - last)} ago"
 
 
+async def _reconcile_discord_activity(guild, db, member_ids, cutoff):
+    """Reconciles newest guild-message times from accessible channel history.
+
+    Each channel receives one durable full-history backfill. Later checks only
+    scan the requested recent window, while live ``on_message`` tracking covers
+    messages received while the bot is online.
+    """
+    lock = _DISCORD_HISTORY_LOCKS.setdefault(guild.id, asyncio.Lock())
+    async with lock:
+        channels = list({channel.id: channel for channel in (
+            *guild.text_channels, *guild.threads
+        )}.values())
+        backfilled = db.get_backfilled_discord_channels(
+            guild.id, (channel.id for channel in channels)
+        )
+        needs_backfill = {
+            channel.id for channel in channels if channel.id not in backfilled
+        }
+        covered_since = _DISCORD_HISTORY_COVERAGE.get(guild.id)
+        if covered_since is not None and covered_since <= cutoff:
+            channels = [
+                channel for channel in channels if channel.id in needs_backfill
+            ]
+            if not channels:
+                return 0
+
+        async def scan_channel(channel):
+            channel_latest = {}
+            scanned_messages = 0
+            full_backfill = channel.id in needs_backfill
+            try:
+                async for historical in channel.history(
+                    limit=None,
+                    after=None if full_backfill else cutoff,
+                    oldest_first=False,
+                ):
+                    scanned_messages += 1
+                    author_id = historical.author.id
+                    if author_id not in member_ids or author_id in channel_latest:
+                        continue
+                    channel_latest[author_id] = (
+                        historical.created_at.astimezone(timezone.utc)
+                        .isoformat(timespec="milliseconds")
+                        .replace("+00:00", "Z")
+                    )
+                completed_channel = channel.id if full_backfill else None
+                return channel_latest, scanned_messages, 0, completed_channel
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "Skipping Discord history for channel %s during !showstale: %s",
+                    channel.id,
+                    exc,
+                )
+                return {}, scanned_messages, 1, None
+
+        results = await asyncio.gather(*(scan_channel(channel) for channel in channels))
+        latest = {}
+        scanned_messages = 0
+        skipped_channels = 0
+        completed_channels = []
+        for channel_latest, channel_count, channel_skipped, completed_channel in results:
+            scanned_messages += channel_count
+            skipped_channels += channel_skipped
+            if completed_channel is not None:
+                completed_channels.append(completed_channel)
+            for author_id, timestamp in channel_latest.items():
+                if timestamp > latest.get(author_id, ""):
+                    latest[author_id] = timestamp
+
+        if latest:
+            db.record_discord_activity_batch(latest)
+        if completed_channels:
+            completed_at = (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+            db.mark_discord_channels_backfilled(
+                guild.id, completed_channels, completed_at
+            )
+        if skipped_channels:
+            _DISCORD_HISTORY_COVERAGE.pop(guild.id, None)
+        else:
+            previous_coverage = _DISCORD_HISTORY_COVERAGE.get(guild.id)
+            _DISCORD_HISTORY_COVERAGE[guild.id] = (
+                cutoff
+                if previous_coverage is None
+                else min(previous_coverage, cutoff)
+            )
+        logger.info(
+            "Discord stale history scan: %s messages, %s active members, "
+            "%s channels fully backfilled, %s skipped channels",
+            scanned_messages,
+            len(latest),
+            len(completed_channels),
+            skipped_channels,
+        )
+        return skipped_channels
+
+
+def _discord_history_needs_scan(guild, db, cutoff):
+    """Whether recent or never-backfilled channel history needs scanning."""
+    channel_ids = [channel.id for channel in (*guild.text_channels, *guild.threads)]
+    backfilled = db.get_backfilled_discord_channels(guild.id, channel_ids)
+    if any(channel_id not in backfilled for channel_id in channel_ids):
+        return True
+    covered_since = _DISCORD_HISTORY_COVERAGE.get(guild.id)
+    return covered_since is None or covered_since > cutoff
+
+
+def _discord_member_label(member):
+    """Stable, non-pinging label for a Discord guild member."""
+    display_name = discord.utils.escape_markdown(member.display_name)
+    return f"@{display_name}"
+
+
 async def cmd_show_stale(message, data, api):
-    """!showstale <duration> [combined|htb|discord] -- lists current team
-    members with no recorded activity in the selected source(s).
+    """!showstale <duration> [htb|discord] -- lists stale current HTB members
+    by default, or stale human members of the Discord guild.
     """
     raw = data.strip()
     if not raw:
         await message.channel.send(
-            "Usage: !showstale <duration> [combined|htb|discord] "
-            "(e.g. !showstale 30d, !showstale 30d htb)",
+            "Usage: !showstale <duration> [htb|discord] "
+            "(e.g. !showstale 30d, !showstale 30d discord)",
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
@@ -1246,7 +1365,7 @@ async def cmd_show_stale(message, data, api):
     parsed = _parse_stale_args(raw)
     if parsed is None:
         await message.channel.send(
-            "Usage: !showstale <duration> [combined|htb|discord]. "
+            "Usage: !showstale <duration> [htb|discord]. "
             "Duration uses s|m|h|d|w|mo|y (e.g. 30d or 6mo).",
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1256,14 +1375,50 @@ async def cmd_show_stale(message, data, api):
     now = datetime.now(timezone.utc)
     cutoff = (now - delta).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    rows = database.get().get_stale_users(cutoff, mode)
-    source_labels = {
-        "combined": "HTB or Discord",
-        "htb": "HTB",
-        "discord": "Discord",
-    }
-    source_label = source_labels[mode]
+    db = database.get()
+    if mode == "discord":
+        if message.guild is None:
+            await message.channel.send(
+                "Discord stale checks must be run inside the configured server.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        try:
+            members = [member async for member in message.guild.fetch_members(limit=None)]
+        except (discord.ClientException, discord.HTTPException) as exc:
+            logger.error("Failed to fetch Discord guild members for !showstale: %s", exc)
+            await message.channel.send(
+                "Couldn't fetch the Discord member list. Check that Server Members Intent is enabled.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        members = [member for member in members if not member.bot]
+        if _discord_history_needs_scan(message.guild, db, now - delta):
+            await message.channel.send(
+                "Checking Discord history; the first full backfill may take "
+                "a while...",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        skipped_channels = await _reconcile_discord_activity(
+            message.guild,
+            db,
+            {member.id for member in members},
+            now - delta,
+        )
+        activity = db.get_discord_activity(member.id for member in members)
+        rows = [
+            (member, activity.get(member.id))
+            for member in members
+            if activity.get(member.id) is None or activity[member.id] < cutoff
+        ]
+        rows.sort(key=lambda item: (item[1] is not None, item[1] or ""))
+    else:
+        rows = db.get_stale_htb_users(cutoff)
+
     if not rows:
+        source_label = "Discord post" if mode == "discord" else "HTB solve"
         await message.channel.send(
             f"No stale users -- everyone has {source_label} activity within "
             f"the last {duration_raw}.",
@@ -1271,21 +1426,23 @@ async def cmd_show_stale(message, data, api):
         )
         return
 
-    lines = [f"**Stale users (no {source_label} activity in the last {duration_raw}):**"]
-    for row in rows:
-        htb_status = _activity_age(row["last_active"], now)
-        if row["discord_id"] is None:
-            discord_status = "not linked"
-        else:
-            discord_status = _activity_age(row["discord_last_active"], now)
-
-        if mode == "combined":
-            detail = f"HTB: {htb_status}; Discord: {discord_status}"
-        elif mode == "htb":
-            detail = f"HTB: {htb_status}"
-        else:
-            detail = f"Discord: {discord_status}"
-        lines.append(f"  `{row['name']}` -- {detail}")
+    if mode == "discord":
+        lines = [f"**Stale Discord members (no posts in the last {duration_raw}):**"]
+        for member, last_active in rows:
+            lines.append(
+                f"  {_discord_member_label(member)} -- "
+                f"Discord: {_activity_age(last_active, now)}"
+            )
+        if skipped_channels:
+            lines.append(
+                f"  _Warning: could not read history in {skipped_channels} channel(s)._"
+            )
+    else:
+        lines = [f"**Stale HTB members (no solves in the last {duration_raw}):**"]
+        for row in rows:
+            lines.append(
+                f"  `{row['name']}` -- HTB: {_activity_age(row['last_active'], now)}"
+            )
 
     await _send_text_lines(message.channel, lines)
 
